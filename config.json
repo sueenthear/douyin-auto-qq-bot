@@ -1,0 +1,12 @@
+{
+  "napcat": {
+    "ws_url": "ws://127.0.0.1:3001/",
+    "token": "123456",
+    "reconnect_interval": 5,
+    "read_timeout": 90
+  },
+  "download_dir": "downloads",
+  "keep_files": false,
+  "process_timeout": 300,
+  "cookie_refresh_timeout": 60
+}

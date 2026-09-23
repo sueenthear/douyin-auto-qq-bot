@@ -1,0 +1,24 @@
+# 凭据与浏览器会话（含登录态，切勿提交）
+cookies.json
+.browser_profile/
+
+# 个人配置（含真实 QQ 号，切勿提交；模板见 allow.example.txt）
+allow.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# 下载产物（视频 + 图集图片）
+output/
+downloads/
+*.mp4
+*.part
+*.jpeg
+*.jpg
+*.png
+*.webp
