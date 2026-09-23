@@ -73,7 +73,9 @@ pip install -r requirements.txt
   "download_dir": "downloads",
   "keep_files": false,
   "process_timeout": 300,
-  "cookie_refresh_timeout": 60
+  "cookie_refresh_timeout": 60,
+  "risk_retry_attempts": 3,
+  "risk_retry_interval": 3
 }
 ```
 
@@ -87,6 +89,8 @@ pip install -r requirements.txt
 | `keep_files` | `false` = 下载到临时目录、发完即删（推荐）；`true` = 保留下载到 `download_dir` |
 | `process_timeout` | 单个作品处理超时（秒） |
 | `cookie_refresh_timeout` | 风控时等待新 Cookie 的上限（秒） |
+| `risk_retry_attempts` | 风控时最多尝试解析的次数（含首次），默认 `3`；设为 `1` 表示不重试 |
+| `risk_retry_interval` | 风控每次重试前的等待秒数，默认 `3` |
 | `messages` | （可选）自定义回复文案，见 2.3 |
 
 ### 2.2 `allow.txt` —— 监听白名单
@@ -207,7 +211,7 @@ python launcher.py --check
 3. 确认消息里确实含抖音链接（要整段分享文案，或直接发 `https://v.douyin.com/xxx/`）
 
 **解析失败？**
-多为抖音风控或登录失效。程序会自动重拉 Cookie 重试一次；仍失败会回发错误信息并附上触发链接。若频繁失败，跑 `python main.py --login` 重新登录。
+多为抖音风控或登录失效。程序会静默重拉 Cookie 并重试（默认最多 3 次、间隔 3s）；次数用尽仍失败会回发错误信息并附上触发链接。若频繁失败，跑 `python main.py --login` 重新登录，或调大 `config.json` 的 `risk_retry_attempts`。
 
 **Bot 频繁断线重连？**
 `config.json` 里 `napcat.read_timeout` 比 NapCat 的心跳间隔小。把它设到心跳的 2~3 倍（心跳 30s → 设 90）。
@@ -287,7 +291,28 @@ python -m pytest douyin_core/tests qq_bot/tests -q
 1. **不发任何报错**（「正在解析中……」回执照常发）
 2. 启动浏览器复用 `.browser_profile` **重新拉取一次 Cookie**
    （profile 内已有登录态，通常无需重新扫码），同步给解析器
-3. 重试一次；**仍失败才发报错，并附上触发链接**
+3. 等待 `risk_retry_interval` 后重试；**最多尝试 `risk_retry_attempts` 次**
+4. 次数用尽仍失败，才发报错并附上触发链接
+
+默认最多尝试 **3 次**、每次重试前等待 **3 秒**，可在 `config.json` 调整：
+
+```json
+{
+  "risk_retry_attempts": 3,
+  "risk_retry_interval": 3
+}
+```
+
+日志形如：
+
+```
+[风控] 第 1/3 次触发（接口风控（HTTP 403）） —— 刷新 Cookie 后重试
+[风控] 已重新拉取并保存 Cookie
+[风控] 第 2/3 次触发（接口风控（HTTP 403）） —— 刷新 Cookie 后重试
+[风控] 第 3/3 次尝试解析成功
+```
+
+若期间遇到非风控错误（如作品已删除），会立即返回该错误、不再重试。
 
 实现上，`douyin_api.RiskControlError`（`DouyinAPIError` 子类）专门标识风控，
 `douyin_parser._fetch_info` 会**显式放行**它而不是当作普通错误降级 —— 否则上层收不到

@@ -8,5 +8,7 @@
   "download_dir": "downloads",
   "keep_files": false,
   "process_timeout": 300,
-  "cookie_refresh_timeout": 60
+  "cookie_refresh_timeout": 60,
+  "risk_retry_attempts": 3,
+  "risk_retry_interval": 3
 }

@@ -12,7 +12,9 @@
       },
       "download_dir": "downloads",
       "keep_files": false,
-      "cookie_refresh_timeout": 60
+      "cookie_refresh_timeout": 60,
+      "risk_retry_attempts": 3,
+      "risk_retry_interval": 3
     }
 
 **allow.txt** —— 监听白名单，一行一个条目，以 ``//`` 开头的整行是注释：
@@ -20,6 +22,9 @@
     // 群号用 # 开头，私聊号用 * 开头
     *100000001
     #200000003
+
+**风控重试**：``risk_retry_attempts``（最多尝试解析的次数，含首次，默认 3；
+设为 1 表示不重试）与 ``risk_retry_interval``（每次重试前的等待秒数，默认 3）。
 """
 
 from __future__ import annotations
@@ -34,6 +39,10 @@ COMMENT_PREFIX = "//"
 
 DEFAULT_CONFIG_FILE = "config.json"
 DEFAULT_ALLOW_FILE = "allow.txt"
+
+# 风控重试默认值：最多尝试 3 次（含首次），每次重试前等待 3 秒
+DEFAULT_RISK_ATTEMPTS = 3
+DEFAULT_RISK_INTERVAL = 3.0
 
 DEFAULT_MESSAGES = {
     "video": "检测到抖音视频分享链接，正在解析中……",
@@ -139,6 +148,9 @@ class BotConfig:
     process_timeout: float = 300.0
     # 风控时重新拉取 Cookie 的等待上限（秒）
     cookie_refresh_timeout: float = 60.0
+    # 风控重试：最多尝试解析的次数（含首次）与每次重试前的等待（秒）
+    risk_retry_attempts: int = DEFAULT_RISK_ATTEMPTS
+    risk_retry_interval: float = DEFAULT_RISK_INTERVAL
 
     def is_watched(self, message_type: str, target_id: int) -> bool:
         """该会话是否在白名单内。"""
@@ -161,6 +173,15 @@ def _as_float(value, field_name: str, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         raise ConfigError(f"{field_name} 必须是数字，收到 {value!r}")
+
+
+def _as_int(value, field_name: str, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{field_name} 必须是整数，收到 {value!r}")
 
 
 def load_config(config_path: str = DEFAULT_CONFIG_FILE,
@@ -208,6 +229,12 @@ def load_config(config_path: str = DEFAULT_CONFIG_FILE,
         data.get("process_timeout"), "process_timeout", 300.0)
     cfg.cookie_refresh_timeout = _as_float(
         data.get("cookie_refresh_timeout"), "cookie_refresh_timeout", 60.0)
+    cfg.risk_retry_attempts = max(1, _as_int(
+        data.get("risk_retry_attempts"), "risk_retry_attempts",
+        DEFAULT_RISK_ATTEMPTS))
+    cfg.risk_retry_interval = max(0.0, _as_float(
+        data.get("risk_retry_interval"), "risk_retry_interval",
+        DEFAULT_RISK_INTERVAL))
 
     messages = dict(DEFAULT_MESSAGES)
     raw_messages = data.get("messages")

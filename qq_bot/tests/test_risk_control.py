@@ -16,6 +16,8 @@ class FakeConfig:
     cookie_refresh_timeout = 60.0
     keep_files = False
     download_dir = "downloads"
+    risk_retry_attempts = 3          # 最多尝试 3 次（含首次）
+    risk_retry_interval = 0.0        # 测试中不真等待
 
     def __init__(self):
         self.messages = {
@@ -48,8 +50,10 @@ class FakeParser:
         self.cookie = cookie
 
 
-def make_bot(script, refresh_ok=True):
+def make_bot(script, refresh_ok=True, attempts=3, interval=0.0):
     cfg = FakeConfig()
+    cfg.risk_retry_attempts = attempts
+    cfg.risk_retry_interval = interval
     bot = DouyinQQBot.__new__(DouyinQQBot)          # 跳过 __init__（不连 NapCat）
     bot.config = cfg
     bot.log = lambda m: None
@@ -80,15 +84,61 @@ def test_normal_parse_no_refresh():
     assert bot.refreshed == 0          # 未触发风控 → 不刷新 Cookie
 
 
-# ---------------------------------------------------------------- 风控重试成功
+# ---------------------------------------------------------------- 风控重试（默认 3 次 / 间隔 3s）
 
 def test_risk_control_refresh_then_success():
+    """第 2 次就成功：只刷新 1 次 Cookie，共解析 2 次。"""
     info = VideoInfo(item_id="1", title="魔女之夜", play_url="http://x")
     bot = make_bot([RiskControlError("接口风控（HTTP 403）"), info])
     got, err = bot._parse_with_risk_retry(SHARE)
     assert got is info and err == ""
-    assert bot.refreshed == 1          # 只刷新一次
-    assert bot.parser.calls == 2       # 重试一次
+    assert bot.refreshed == 1
+    assert bot.parser.calls == 2
+
+
+def test_risk_control_succeeds_on_third_attempt():
+    """第 3 次才成功：刷新 2 次，共解析 3 次。"""
+    info = VideoInfo(item_id="1", play_url="http://x")
+    bot = make_bot([RiskControlError("403"), RiskControlError("403"), info])
+    got, err = bot._parse_with_risk_retry(SHARE)
+    assert got is info and err == ""
+    assert bot.refreshed == 2
+    assert bot.parser.calls == 3
+
+
+def test_risk_control_exhausts_three_attempts():
+    """持续风控：共解析 3 次、刷新 2 次（第 3 次失败后不再刷新）。"""
+    bot = make_bot([RiskControlError("403"), RiskControlError("403"),
+                    RiskControlError("接口风控（HTTP 403）")])
+    got, err = bot._parse_with_risk_retry(SHARE)
+    assert got is None
+    assert bot.parser.calls == 3
+    assert bot.refreshed == 2
+    assert "风控" in err
+    assert URL in err
+
+
+def test_risk_retry_interval_is_waited(monkeypatch):
+    """重试前确实等待了配置的间隔（3s）。"""
+    slept = []
+    monkeypatch.setattr("qq_bot.handler.time.sleep",
+                        lambda s: slept.append(s))
+    info = VideoInfo(item_id="1", play_url="http://x")
+    bot = make_bot([RiskControlError("403"), RiskControlError("403"), info],
+                   interval=3.0)
+    got, _ = bot._parse_with_risk_retry(SHARE)
+    assert got is info
+    assert slept == [3.0, 3.0]        # 两次重试各等 3 秒
+
+
+def test_risk_retry_attempts_configurable():
+    """attempts=1 时只试一次，不刷新 Cookie。"""
+    bot = make_bot([RiskControlError("403")], attempts=1)
+    got, err = bot._parse_with_risk_retry(SHARE)
+    assert got is None
+    assert bot.parser.calls == 1
+    assert bot.refreshed == 0
+    assert URL in err
 
 
 def test_risk_control_does_not_leak_error_message():
@@ -102,13 +152,13 @@ def test_risk_control_does_not_leak_error_message():
 # ---------------------------------------------------------------- 风控仍失败
 
 def test_risk_control_persists_reports_with_link():
-    bot = make_bot([RiskControlError("403"),
+    """持续风控：报错文案必须带触发链接。"""
+    bot = make_bot([RiskControlError("403"), RiskControlError("403"),
                     RiskControlError("接口风控（HTTP 403）")])
     got, err = bot._parse_with_risk_retry(SHARE)
     assert got is None
     assert "风控" in err
-    assert URL in err                  # 报错必须带触发链接
-    assert bot.refreshed == 1          # 只尝试一次
+    assert URL in err
 
 
 def test_risk_refresh_failure_reports_with_link():
@@ -198,11 +248,12 @@ def test_unexpected_exception_is_wrapped():
 
 
 def test_risk_after_refresh_but_other_error():
-    """刷新后遇到非风控错误 → 走普通 error 模板。"""
+    """重试中遇到非风控错误 → 立即返回普通 error 模板（不继续重试）。"""
     bot = make_bot([RiskControlError("403"), ParseError("作品已删除")])
     got, err = bot._parse_with_risk_retry(SHARE)
     assert got is None
     assert err == "解析失败：作品已删除"
+    assert bot.parser.calls == 2       # 第二次就返回，不再重试
 
 
 # ---------------------------------------------------------------- 异常层级

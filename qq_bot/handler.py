@@ -22,6 +22,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from typing import Callable, Optional
 
 from douyin_core import DouyinParser, ParseError, downloader, extract_share_url
@@ -216,34 +217,42 @@ class DouyinQQBot:
     # ------------------------------------------------------------ 风控重试
 
     def _parse_with_risk_retry(self, text: str):
-        """解析作品；遇 403 风控则刷新一次 Cookie 后重试。
+        """解析作品；遇风控则刷新 Cookie 并重试，最多尝试 N 次（默认 3）。
+
+        流程：解析 → 若风控则「刷新 Cookie + 等待间隔」→ 重试 …… 直到成功、
+        次数用尽，或遇到非风控错误。期间不发任何报错（静默重试）。
 
         :return: (info, "") 成功；(None, 报错文案) 失败
         """
-        try:
-            return self.parser.parse_text(text), ""
-        except RiskControlError as e:
-            # 风控：不发报错，先静默尝试重新拉取 Cookie
-            self.log(f"[风控] {e} —— 尝试刷新 Cookie 后重试")
-            url = extract_share_url(text) or ""
-            if not self._refresh_cookie():
-                return None, self._risk_message(url, "刷新 Cookie 失败")
+        attempts = max(1, getattr(self.config, "risk_retry_attempts", 3))
+        interval = max(0.0, getattr(self.config, "risk_retry_interval", 3.0))
+        url = extract_share_url(text) or ""
+        last_reason = ""
 
+        for attempt in range(1, attempts + 1):
             try:
                 info = self.parser.parse_text(text)
-                self.log("[风控] 刷新 Cookie 后解析成功")
+                if attempt > 1:
+                    self.log(f"[风控] 第 {attempt}/{attempts} 次尝试解析成功")
                 return info, ""
-            except RiskControlError as e2:
-                return None, self._risk_message(url, str(e2))
-            except ParseError as e2:
-                return None, self.config.messages["error"].format(error=e2)
-            except Exception as e2:
-                return None, self.config.messages["error"].format(error=e2)
-        except ParseError as e:
-            return None, self.config.messages["error"].format(error=e)
-        except Exception as e:
-            return None, self.config.messages["error"].format(
-                error=f"{type(e).__name__}: {e}")
+            except RiskControlError as e:
+                last_reason = str(e)
+                if attempt >= attempts:
+                    break
+                # 风控：不发报错，先静默尝试重新拉取 Cookie
+                self.log(f"[风控] 第 {attempt}/{attempts} 次触发（{e}）"
+                         f" —— 刷新 Cookie 后重试")
+                if not self._refresh_cookie():
+                    return None, self._risk_message(url, "刷新 Cookie 失败")
+                if interval:
+                    time.sleep(interval)
+            except ParseError as e:
+                return None, self.config.messages["error"].format(error=e)
+            except Exception as e:
+                return None, self.config.messages["error"].format(
+                    error=f"{type(e).__name__}: {e}")
+
+        return None, self._risk_message(url, last_reason)
 
     def _risk_message(self, url: str, reason: str) -> str:
         """风控最终失败时的报错文案（含触发链接）。"""
