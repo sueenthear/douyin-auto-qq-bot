@@ -14,7 +14,10 @@
       "keep_files": false,
       "cookie_refresh_timeout": 60,
       "risk_retry_attempts": 3,
-      "risk_retry_interval": 3
+      "risk_retry_interval": 3,
+      "request_min_interval": 1,
+      "request_jitter_ratio": 0.5,
+      "proxy": ""
     }
 
 **allow.txt** —— 监听白名单，一行一个条目，以 ``//`` 开头的整行是注释：
@@ -151,6 +154,11 @@ class BotConfig:
     # 风控重试：最多尝试解析的次数（含首次）与每次重试前的等待（秒）
     risk_retry_attempts: int = DEFAULT_RISK_ATTEMPTS
     risk_retry_interval: float = DEFAULT_RISK_INTERVAL
+    # 请求节流（防频率风控）：最小请求间隔与随机抖动比例
+    request_min_interval: float = 1.0
+    request_jitter_ratio: float = 0.5
+    # 代理（防 IP 维度风控）；空 = 直连
+    proxy: str = ""
 
     def is_watched(self, message_type: str, target_id: int) -> bool:
         """该会话是否在白名单内。"""
@@ -235,6 +243,11 @@ def load_config(config_path: str = DEFAULT_CONFIG_FILE,
     cfg.risk_retry_interval = max(0.0, _as_float(
         data.get("risk_retry_interval"), "risk_retry_interval",
         DEFAULT_RISK_INTERVAL))
+    cfg.request_min_interval = max(0.0, _as_float(
+        data.get("request_min_interval"), "request_min_interval", 1.0))
+    cfg.request_jitter_ratio = max(0.0, _as_float(
+        data.get("request_jitter_ratio"), "request_jitter_ratio", 0.5))
+    cfg.proxy = str(data.get("proxy") or "").strip()
 
     messages = dict(DEFAULT_MESSAGES)
     raw_messages = data.get("messages")

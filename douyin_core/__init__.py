@@ -32,11 +32,14 @@ from . import douyin_api, downloader, login_manager
 from .douyin_api import (
     DouyinAPIError,
     RiskControlError,
+    configure_proxy,
+    configure_rate_limit,
     ensure_ms_token,
     ensure_ttwid,
     fetch_video_detail,
     pick_video_candidates,
     sign_url,
+    throttle,
 )
 from .downloader import (
     DownloadError,
@@ -68,6 +71,9 @@ __all__ = [
     "douyin_api",
     "DouyinAPIError",
     "RiskControlError",
+    "configure_rate_limit",
+    "configure_proxy",
+    "throttle",
     "fetch_video_detail",
     "pick_video_candidates",
     "sign_url",

@@ -75,7 +75,10 @@ pip install -r requirements.txt
   "process_timeout": 300,
   "cookie_refresh_timeout": 60,
   "risk_retry_attempts": 3,
-  "risk_retry_interval": 3
+  "risk_retry_interval": 3,
+  "request_min_interval": 1,
+  "request_jitter_ratio": 0.5,
+  "proxy": ""
 }
 ```
 
@@ -91,6 +94,9 @@ pip install -r requirements.txt
 | `cookie_refresh_timeout` | 风控时等待新 Cookie 的上限（秒） |
 | `risk_retry_attempts` | 风控时最多尝试解析的次数（含首次），默认 `3`；设为 `1` 表示不重试 |
 | `risk_retry_interval` | 风控每次重试前的等待秒数，默认 `3` |
+| `request_min_interval` | **请求节流**：两次抖音请求的最小间隔秒数，默认 `1`；频繁被风控就调大 |
+| `request_jitter_ratio` | 节流的随机抖动比例，默认 `0.5`（实际间隔 = 1.0~1.5 倍） |
+| `proxy` | 代理地址（如 `http://127.0.0.1:7890`），用于规避 IP 风控；空 = 直连 |
 | `messages` | （可选）自定义回复文案，见 2.3 |
 
 ### 2.2 `allow.txt` —— 监听白名单
@@ -283,6 +289,62 @@ python -m pytest douyin_core/tests qq_bot/tests -q
 ---
 
 # 实现要点（排障参考）
+
+## 防风控措施
+
+抖音对**请求频率**很敏感：连续解析几个作品就会返回
+`403 Blocked by ArgusSecurityPlugin`。项目内置以下措施：
+
+### 1. 请求节流（最有效）
+
+所有对抖音的请求共享一个全局最小间隔，并叠加随机抖动，避免突发流量：
+
+```json
+{
+  "request_min_interval": 1,
+  "request_jitter_ratio": 0.5
+}
+```
+
+- `request_min_interval`：两次请求之间的最小间隔（秒），默认 `1`
+- `request_jitter_ratio`：额外随机抖动比例，默认 `0.5`（即实际间隔为
+  `1.0 ~ 1.5` 秒随机），使请求节奏不像脚本
+
+**觉得还是频繁被风控，就调大这两个值**（例如 `2` / `1.0`）。这是最直接的手段。
+
+### 2. msToken 缓存
+
+`default_query()` 原本每次调用都会打一次 `mssdk` 接口换取 msToken ——
+即**每个作品解析都多一次请求**，请求量翻倍且更易触发风控。
+
+现在生成结果会缓存 30 分钟（`_MS_TOKEN_TTL`），同一会话内只请求一次。
+
+### 3. 代理支持
+
+`config.json` 里配置代理可规避 **IP 维度**的风控：
+
+```json
+{
+  "proxy": "http://127.0.0.1:7890"
+}
+```
+
+留空表示直连。配置后，详情请求与 ttwid 注册都会走该代理。
+
+### 4. 指数退避重试
+
+单次请求遇 403/429 时，会在内部按 `1s → 2s → 5s` 退避重试（`_RETRY_DELAYS`），
+再交给上层的「刷新 Cookie 重试」流程。
+
+### 5. 风控后自动重登
+
+见下一节。**注意顺序**：先靠节流「少触发」，触发后才走重登兜底 ——
+频繁重登（每次都会开一次浏览器）本身也会加重风控。
+
+### 实测基线
+
+未开启节流时，连续解析 4 个作品，第 3 个即触发 403（风控率 25%）。
+节流生效后请求被拉平，触发概率显著下降。
 
 ## 403 风控：静默刷新 Cookie 后重试
 

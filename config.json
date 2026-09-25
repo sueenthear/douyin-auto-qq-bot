@@ -10,5 +10,8 @@
   "process_timeout": 300,
   "cookie_refresh_timeout": 60,
   "risk_retry_attempts": 3,
-  "risk_retry_interval": 3
+  "risk_retry_interval": 3,
+  "request_min_interval": 1,
+  "request_jitter_ratio": 0.5,
+  "proxy": ""
 }

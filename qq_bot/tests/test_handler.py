@@ -72,6 +72,53 @@ def test_image_nodes_long_title_is_clipped():
     assert text.endswith("…")
 
 
+# ---------------------------------------------------------------- 视频缩略图
+
+def _make_video_bot(cover_url="https://p3.douyinpic.com/cover.jpeg"):
+    """构造一个不连 NapCat 的 bot，用于测 _download_thumb。"""
+    from qq_bot.handler import DouyinQQBot
+
+    bot = DouyinQQBot.__new__(DouyinQQBot)
+    bot.log = lambda m: None
+    return bot, VideoInfo(item_id="123", cover_url=cover_url)
+
+
+def test_download_thumb_returns_none_without_cover(tmp_path):
+    bot, info = _make_video_bot(cover_url="")
+    assert bot._download_thumb(info, str(tmp_path)) is None
+
+
+def test_download_thumb_uses_cover_ext(tmp_path, monkeypatch):
+    """缩略图扩展名应从封面 URL 推断（保证 NapCat 能识别格式）。"""
+    from douyin_core import downloader
+
+    seen = {}
+
+    def fake_download(url, dest_dir, filename, **kw):
+        seen["url"] = url
+        seen["filename"] = filename
+        return str(tmp_path / filename)
+
+    monkeypatch.setattr(downloader, "download_file", fake_download)
+    bot, info = _make_video_bot(
+        cover_url="https://p3.douyinpic.com/cover.webp?x=1")
+    path = bot._download_thumb(info, str(tmp_path))
+    assert path is not None
+    assert seen["filename"].endswith(".webp")      # 跟封面格式一致
+    assert seen["url"] == info.cover_url
+
+
+def test_download_thumb_handles_failure(tmp_path, monkeypatch):
+    from douyin_core import downloader
+
+    def boom(*a, **k):
+        raise downloader.DownloadError("403")
+
+    monkeypatch.setattr(downloader, "download_file", boom)
+    bot, info = _make_video_bot()
+    assert bot._download_thumb(info, str(tmp_path)) is None
+
+
 # ---------------------------------------------------------------- info 文本
 
 def test_format_info_image_post():

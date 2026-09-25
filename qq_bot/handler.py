@@ -26,7 +26,9 @@ import time
 from typing import Callable, Optional
 
 from douyin_core import DouyinParser, ParseError, downloader, extract_share_url
+from douyin_core import douyin_api
 from douyin_core.douyin_api import RiskControlError
+from douyin_core.douyin_parser import _image_ext
 from douyin_core.login_manager import CookieStore, LoginManager
 
 from .napcat import (NapCatClient, NapCatError, build_node, image_seg,
@@ -117,6 +119,11 @@ class DouyinQQBot:
         self.client = client
         self.self_id = self_id
         self.log = logger or (lambda m: None)
+        # 应用防风控参数：请求节流 + 代理（从 config.json 读取）
+        douyin_api.configure_rate_limit(
+            getattr(config, "request_min_interval", 1.0),
+            getattr(config, "request_jitter_ratio", 0.5))
+        douyin_api.configure_proxy(getattr(config, "proxy", ""))
         self.parser = DouyinParser(cookie=CookieStore().load())
         self.login = LoginManager()
         # 同一时刻只允许一个刷新 Cookie 的浏览器实例
@@ -291,9 +298,35 @@ class DouyinQQBot:
             return
         size_mb = os.path.getsize(path) / 1024 / 1024
         self.log(f"[视频] 已下载 {size_mb:.1f} MB，开始上传…")
+
+        # 缩略图：优先用作品封面（比 NapCat 自动抽帧更准，且不依赖其 ffmpeg）
+        data = {"file": to_file_uri(path)}
+        thumb = self._download_thumb(info, work_dir)
+        if thumb:
+            data["thumb"] = to_file_uri(thumb)
+            self.log(f"[视频] 已附加缩略图：{os.path.basename(thumb)}")
+        else:
+            self.log("[视频] 未能取到封面，交由 NapCat 自行抽帧")
+
         self._try_send(message_type, target_id,
-                       [{"type": "video", "data": {"file": to_file_uri(path)}}],
-                       timeout=180)
+                       [{"type": "video", "data": data}], timeout=180)
+
+    def _download_thumb(self, info, work_dir: str):
+        """下载作品封面作为视频缩略图；失败返回 None。
+
+        扩展名从封面 URL 推断（抖音封面常见 jpeg/webp），确保 NapCat 能正确识别。
+        """
+        if not info.cover_url:
+            return None
+        ext = _image_ext(info.cover_url)
+        try:
+            path = downloader.download_file(
+                info.cover_url, work_dir, f"thumb_{info.item_id}.{ext}",
+                headers={"Referer": "https://www.douyin.com/"})
+            return path
+        except downloader.DownloadError as e:
+            self.log(f"[缩略图] 下载失败：{e}")
+            return None
 
     # ------------------------------------------------------------ 图文
 

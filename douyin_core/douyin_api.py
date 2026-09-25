@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import random
 import string
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -222,6 +223,10 @@ class RiskControlError(DouyinAPIError):
 
 # ---------------------------------------------------------------- msToken
 
+# msToken 缓存：避免每个作品解析都多打一次 mssdk 接口
+_ms_token_cache: tuple = ("", 0.0)
+_MS_TOKEN_TTL = 1800.0      # 30 分钟
+
 
 def _gen_fake_ms_token() -> str:
     """随机占位 msToken（长度 184，与真实 token 一致）。"""
@@ -269,17 +274,31 @@ def _gen_real_ms_token(timeout: float = 8.0) -> str:
 
 
 def ensure_ms_token(cookie: str = "") -> str:
-    """返回可用的 msToken：Cookie 中的 → mssdk 生成 → 随机占位。"""
+    """返回可用的 msToken：Cookie 中的 → 缓存 → mssdk 生成 → 随机占位。
+
+    mssdk 生成结果会被缓存（默认 30 分钟）。否则每个作品解析都会多打一次
+    mssdk 接口，请求量翻倍且更容易触发风控。
+    """
+    global _ms_token_cache
     for item in cookie.split(";"):
         item = item.strip()
         if item.startswith("msToken="):
             token = item.split("=", 1)[1].strip()
             if _is_valid_ms_token(token):
                 return token
+
+    cached, cached_at = _ms_token_cache
+    if cached and (time.time() - cached_at) < _MS_TOKEN_TTL:
+        return cached
+
     real = _gen_real_ms_token()
     if real:
+        _ms_token_cache = (real, time.time())
         return real
-    return _gen_fake_ms_token()
+    # mssdk 不可用：用随机占位，并缓存以免每次重复请求
+    fake = _gen_fake_ms_token()
+    _ms_token_cache = (fake, time.time())
+    return fake
 
 
 # ---------------------------------------------------------------- 参数与签名
@@ -368,11 +387,13 @@ def ensure_ttwid(cookie: str = "") -> str:
     if _ttwid_cache:
         return _ttwid_cache
     try:
+        throttle()
         resp = requests.post(
             _TTWID_REGISTER_URL,
             data=_TTWID_BODY,
             headers={"Content-Type": "application/json; charset=utf-8"},
             timeout=10,
+            proxies=_proxies(),
         )
         ttwid = resp.cookies.get("ttwid") or ""
         if ttwid:
@@ -381,6 +402,63 @@ def ensure_ttwid(cookie: str = "") -> str:
     except requests.RequestException:
         pass
     return ""
+
+
+# ---------------------------------------------------------------- 代理
+
+# 代理配置（用于规避 IP 维度的风控；空表示直连）
+_proxy_url = ""
+
+
+def configure_proxy(proxy: str = "") -> None:
+    """设置 HTTP/HTTPS 代理（供上层从 config.json 设置）。空字符串 = 直连。"""
+    global _proxy_url
+    _proxy_url = str(proxy or "").strip()
+
+
+def _proxies() -> Optional[Dict[str, str]]:
+    """返回 requests 用的 proxies 参数；未配置代理时返回 None（直连）。"""
+    if not _proxy_url:
+        return None
+    return {"http": _proxy_url, "https": _proxy_url}
+
+
+# ---------------------------------------------------------------- 请求节流
+
+# 全局最小请求间隔（秒）：所有对抖音的请求共享，避免突发流量触发频率风控。
+# 参考 jiji262/douyin-downloader 的实践（默认约 2 req/s，且建议降并发）。
+_rate_lock = threading.Lock()
+_last_request_at = 0.0
+_min_interval = 1.0        # 基础最小间隔（秒）
+_jitter_ratio = 0.5        # 额外随机抖动：0~50% 的基础间隔
+
+
+def configure_rate_limit(min_interval: float = None,
+                         jitter_ratio: float = None) -> None:
+    """配置请求节流参数（供上层从 config.json 设置）。"""
+    global _min_interval, _jitter_ratio
+    if min_interval is not None:
+        _min_interval = max(0.0, float(min_interval))
+    if jitter_ratio is not None:
+        _jitter_ratio = max(0.0, float(jitter_ratio))
+
+
+def throttle() -> float:
+    """阻塞直到满足最小请求间隔，返回实际等待秒数。
+
+    间隔 = min_interval + 随机抖动，使请求节奏不像脚本。
+    """
+    global _last_request_at
+    with _rate_lock:
+        now = time.time()
+        target = _min_interval
+        if _jitter_ratio:
+            target += random.uniform(0, _min_interval * _jitter_ratio)
+        wait = _last_request_at + target - now
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_at = time.time()
+        return max(0.0, wait)
 
 
 # ---------------------------------------------------------------- 详情接口
@@ -395,6 +473,7 @@ def fetch_video_detail(
     """调用 /aweme/v1/web/aweme/detail/ 获取作品详情。
 
     依次尝试 aid=6383 / 1128；403/429/空响应视为风控，指数退避重试。
+    每次真实请求前会经过全局节流（throttle()），降低频率风控概率。
     :raises DouyinAPIError: 全部尝试失败
     """
     user_agent = _UA
@@ -423,8 +502,10 @@ def fetch_video_detail(
         headers["User-Agent"] = req_ua
 
         for attempt in range(max_retries):
+            throttle()
             try:
-                resp = requests.get(signed_url, headers=headers, timeout=timeout)
+                resp = requests.get(signed_url, headers=headers, timeout=timeout,
+                                    proxies=_proxies())
             except requests.RequestException as e:
                 raise DouyinAPIError(f"详情请求失败：{e}")
 
