@@ -291,13 +291,14 @@ def cmd_login(args) -> int:
     cookie = manager.refresh_cookie_sync(
         timeout=args.timeout,
         progress_cb=lambda m: print(f"  … {m}"),
-        keep_browser=not args.close_browser)
+        keep_browser=args.keep_browser)
 
     if not cookie:
         print()
         print("登录未完成：未取到登录凭证。")
         print(f"处理：确认浏览器已打开并完成扫码；或调大 --timeout"
               f"（当前 {args.timeout:.0f}s）。")
+        print("注：失败时浏览器窗口会保留，便于查看页面报错。")
         return EXIT_FAIL
 
     print()
@@ -512,7 +513,7 @@ def interactive() -> int:
             elif choice == "2":
                 cmd_refresh(argparse.Namespace(timeout=60.0, keep_browser=False))
             elif choice == "3":
-                cmd_login(argparse.Namespace(timeout=300.0, close_browser=False))
+                cmd_login(argparse.Namespace(timeout=300.0, keep_browser=False))
             elif choice == "4":
                 cmd_clear(argparse.Namespace(all=False, yes=False))
             elif choice == "5":
@@ -570,8 +571,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("login", help="打开浏览器登录（扫码 / 账号密码）")
     p.add_argument("--timeout", type=float, default=300.0,
                    help="等待扫码登录的秒数（默认 300）")
-    p.add_argument("--close-browser", action="store_true",
-                   help="登录完成后关闭浏览器窗口（默认保留，便于查看结果）")
+    p.add_argument("--keep-browser", action="store_true",
+                   help="登录成功后仍保留浏览器窗口（默认成功即关闭）")
 
     p = sub.add_parser("clear", help="清空本地持久化（切换账号 / 重登）")
     p.add_argument("--all", action="store_true",

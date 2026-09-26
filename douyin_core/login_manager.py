@@ -219,6 +219,157 @@ def _ensure_selenium() -> Optional[str]:
         return f"selenium 安装失败：{e}"
 
 
+# ---------------------------------------------------------------- profile 占用
+
+def _powershell_exe() -> str:
+    """返回可用于查询进程的 PowerShell 路径；找不到返回空串。"""
+    for name in ("pwsh", "powershell"):
+        exe = shutil.which(name)
+        if exe:
+            return exe
+    fallback = os.path.join(
+        os.environ.get("WINDIR", r"C:\Windows"),
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    return fallback if os.path.isfile(fallback) else ""
+
+
+def find_profile_holders(profile_dir: str) -> Optional[list]:
+    """查找正在占用 ``profile_dir`` 的浏览器进程（仅 Windows）。
+
+    Chromium 系浏览器对 ``user-data-dir`` 加**独占锁**，同一目录不能同时被
+    两个实例使用。若上一次自动化会话的进程未退出（残留），新会话启动时
+    浏览器会**立即退出**，selenium 只报一句含糊的::
+
+        SessionNotCreatedException: session not created:
+        Chrome instance exited.
+
+    完全看不出是「目录被占用」—— 用户看到的只是「浏览器不弹出来了」。
+    这里主动查出来，给出可执行的处置建议。
+
+    :return: ``[(pid, name, is_selenium, is_main), ...]``；
+             **无法检测时返回 None**（调用方据此区分「确认空闲」与
+             「检测不可用」，避免把检测失败误判成无占用）。
+    """
+    if sys.platform != "win32":
+        return None
+    exe = _powershell_exe()
+    if not exe:
+        return None
+
+    script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "Get-CimInstance Win32_Process -Filter "
+        "\"Name='msedge.exe' or Name='chrome.exe'\" "
+        "| Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"
+    )
+    try:
+        proc = subprocess.run(
+            [exe, "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=25,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return None
+
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return None
+
+    # 统一成「反斜杠 + 小写 + 去引号」再比对，避免路径写法差异导致漏判
+    target = os.path.normcase(str(profile_dir)).replace("/", "\\")
+    holders: list = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        command = str(item.get("CommandLine") or "")
+        if not command:
+            continue
+        normalized = os.path.normcase(command.replace('"', "")).replace("/", "\\")
+        if target not in normalized:
+            continue
+        is_selenium = ("--test-type=webdriver" in command
+                       or "--disable-blink-features=AutomationControlled"
+                       in command)
+        holders.append((
+            int(item.get("ProcessId") or 0),
+            str(item.get("Name") or "browser"),
+            is_selenium,
+            "--type=" not in command,          # 主进程（非渲染/GPU 子进程）
+        ))
+    return holders
+
+
+def _profile_lock_message(holders: list, profile_dir: str) -> str:
+    """把占用情况组织成面向用户、可直接照做的提示。"""
+    lines = [f"浏览器配置目录被占用，无法启动：{profile_dir}", "", "占用进程："]
+    # 主进程优先展示（结束主进程后其子进程会一并退出）
+    ordered = sorted(holders, key=lambda h: (not h[3], h[0]))
+    for pid, name, is_selenium, is_main in ordered[:8]:
+        tag = "selenium 残留，可安全结束" if is_selenium else "可能你手动打开的窗口"
+        lines.append(f"  PID {pid}  {name}  [{tag}]"
+                     + ("" if is_main else "  (子进程)"))
+    if len(ordered) > 8:
+        lines.append(f"  …另有 {len(ordered) - 8} 个子进程")
+
+    selenium_main = [h[0] for h in ordered if h[2] and h[3] and h[0]]
+    lines.append("")
+    if selenium_main:
+        args = " ".join(f"/PID {pid}" for pid in selenium_main)
+        lines.append("处理：结束这些残留的自动化浏览器进程后重试")
+        lines.append(f"  taskkill /F {args}")
+    else:
+        lines.append("处理：先关闭上述浏览器窗口，再重试")
+
+    lines += [
+        "",
+        "原因：Chromium 系浏览器对 user-data-dir 加独占锁，残留进程会让新"
+        "实例启动后立即退出",
+        "（selenium 只会报 “session not created: Chrome instance exited”，"
+        "看不出是目录被占用）。",
+    ]
+    return "\n".join(lines)
+
+
+def _quit_driver(driver) -> None:
+    """安静地退出 driver（用于「关闭但不清空 profile」的场景）。"""
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+
+def _launch_driver_checked(kind: str, profile_dir: str):
+    """启动前检查 profile 是否被占用；启动失败时补一次诊断。
+
+    :raises LoginError: 目录被占用（附处置建议）或启动失败
+    """
+    holders = find_profile_holders(profile_dir)
+    if holders:
+        raise LoginError(_profile_lock_message(holders, profile_dir))
+    try:
+        return _launch_driver(kind, profile_dir)
+    except Exception as e:
+        # 启动失败后复查一次：可能是检测放行之后才被别的会话占用
+        holders = find_profile_holders(profile_dir)
+        if holders:
+            raise LoginError(_profile_lock_message(holders, profile_dir))
+        if "session not created" in str(e).lower():
+            raise LoginError(
+                f"浏览器启动失败：{e}\n"
+                "处理：确认 Edge/Chrome 能正常手动打开；若刚结束过进程，"
+                "稍等几秒再重试。")
+        raise
+
+
+
 def _launch_driver(kind: str, profile_dir: str):
     """按浏览器类型创建 webdriver（Selenium Manager 自动下载/匹配 driver）。
 
@@ -321,16 +472,23 @@ class LoginManager:
                 profile_dir = os.path.join(
                     os.path.dirname(os.path.abspath(__file__)),
                     ".browser_profile")
-                driver = _launch_driver(kind, profile_dir)
+                driver = _launch_driver_checked(kind, profile_dir)
                 self._set_state(LoginState.WAITING)
                 on_result(LoginState.WAITING,
                           "浏览器已打开，请在页面中完成登录（扫码或账号密码）…")
+                cookie = ""
                 try:
                     driver.get("https://www.douyin.com/")
                     cookie = self._wait_for_login_cookie(driver, timeout)
                 finally:
-                    # 保留浏览器窗口，让用户看到登录结果；不强制关闭
-                    pass
+                    # 登录成功 → 关闭窗口（Cookie 已抓到，留着只会占用
+                    #   user-data-dir 独占锁，反复登录会堆积进程、导致下次
+                    #   启动时浏览器立刻退出 —— 见 _profile_lock_message）
+                    # 失败/超时 → 保留窗口，便于用户看到报错并手动处理
+                    if cookie:
+                        _quit_driver(driver)
+                    else:
+                        progress("已保留浏览器窗口便于排查；处理完可手动关闭")
 
                 if not cookie:
                     raise LoginError("等待登录超时，请重试")
@@ -338,7 +496,7 @@ class LoginManager:
                 self.store.save(cookie)
                 self._set_state(LoginState.LOGGED_IN)
                 on_result(LoginState.LOGGED_IN,
-                          "登录成功，Cookie 已自动保存")
+                          "登录成功，Cookie 已自动保存（浏览器窗口已关闭）")
             except LoginError as e:
                 self._set_state(LoginState.NOT_LOGGED)
                 on_result(LoginState.NOT_LOGGED, str(e))
@@ -402,16 +560,18 @@ class LoginManager:
 
             profile_dir = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), ".browser_profile")
-            driver = _launch_driver(kind, profile_dir)
+            driver = _launch_driver_checked(kind, profile_dir)
+            cookie = ""
             try:
                 driver.get("https://www.douyin.com/")
                 cookie = self._wait_for_login_cookie(driver, timeout)
             finally:
-                if not keep_browser:
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
+                # 与 start_login_async 同一原则：拿到 Cookie 就关窗口，
+                # 避免残留进程锁住 profile；失败时保留窗口便于排查
+                if cookie and not keep_browser:
+                    _quit_driver(driver)
+                elif not cookie:
+                    progress("已保留浏览器窗口便于排查；处理完可手动关闭")
 
             if not cookie:
                 progress(f"等待 {timeout:.0f}s 未取到登录凭证")

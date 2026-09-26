@@ -217,6 +217,43 @@ python launcher.py --check
 2. 确认 NapCat 在线（`python launcher.py --check`）
 3. 确认消息里确实含抖音链接（要整段分享文案，或直接发 `https://v.douyin.com/xxx/`）
 
+**登录时浏览器不弹出来 / 一直报错？**
+
+典型症状：执行 `python main.py --login` 或 `login` 命令后，浏览器窗口**根本没出现**，
+控制台刷一堆错误，关键一行是：
+
+```
+SessionNotCreatedException: session not created: Chrome instance exited.
+```
+
+**这不是登录本身的问题**，而是浏览器配置目录 `.browser_profile` 被**残留进程占用**了。
+Chromium 系浏览器对 `user-data-dir` 加独占锁，同一目录不能同时被两个实例使用；
+被占用时新实例启动后会立即退出，而 selenium 只会报上面那句含糊错误，看不出真正原因。
+
+残留进程从哪来：早期版本登录成功后**故意不关浏览器**（让用户看结果），
+每次登录都会留下一个 Edge 进程，反复几次就堆积、锁死 profile。
+
+处理：
+
+```powershell
+# 1. 查看占用进程（把 <PID> 换成实际值）
+Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+  Where-Object { $_.CommandLine -match 'browser_profile' } |
+  Select-Object ProcessId, CommandLine
+
+# 2. 结束残留的自动化浏览器进程（只结束主进程即可，子进程会随之退出）
+taskkill /F /PID <PID>
+```
+
+程序现在也会**主动检测**并直接给出上述命令（`find_profile_holders`），
+不再只是抛一句看不懂的 `session not created`。
+
+> 注意：只结束 `--user-data-dir=…\douyin_core\.browser_profile` 的进程，
+> **不要**碰你自己日常使用的 Edge 窗口。
+>
+> 已修复：登录成功后会自动关闭浏览器窗口（Cookie 已落盘，窗口无保留价值），
+> 不再累积进程。失败/超时仍保留窗口，方便你看页面上的报错。
+
 **解析失败？**
 多为抖音风控或登录失效。程序会静默重拉 Cookie 并重试（默认最多 3 次、间隔 3s）；次数用尽仍失败会回发错误信息并附上触发链接。若频繁失败，跑 `python main.py --login` 重新登录，或调大 `config.json` 的 `risk_retry_attempts`。
 
