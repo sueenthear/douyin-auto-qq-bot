@@ -345,8 +345,16 @@ class RiskControlError(DouyinAPIError):
 # body 形如 "Blocked by ArgusSecurityPlugin Uifid Not Found" /
 # "... Signature Not Found"。
 #
-# 关键区别：这类 403 是**确定性**的（请求形状不符），不是频率风控。
-# 重试 / 等退避 / 重新登录都无法通过，反而会加速触发验证码。
+# **重要（实测，推翻早先假设）**：`Uifid Not Found` 是**概率性**的，
+# **不是**确定性拒绝。实测连续 12 次同样请求：5 次被拦、7 次成功，
+# 失败随机穿插，并非「一旦触发就持续」。
+#
+#   实验 A：UIFID UIFID UIFID UIFID OK OK OK OK UIFID OK OK OK  → 7/12 成功
+#   实验 B：连续失败 3 次后，第 4 次重试成功 → 重试确实能突破
+#
+# 因此**必须重试**。早期版本误判为「确定性拒绝」而跳过重试（并跳过刷新
+# Cookie），导致约 40% 的请求直接失败且永不重试 —— 表现为「一旦触发风控，
+# 后续全部解析不了」。切勿再改回短路。
 ARGUS_REJECTION_MARKER = "ArgusSecurityPlugin"
 
 
@@ -360,7 +368,7 @@ def _argus_marker(body: str) -> str:
 
 
 def _is_argus_rejection(status: int, body: str) -> bool:
-    """是否为 Argus 门禁的确定性拒绝（重试无意义）。"""
+    """是否被 Argus 门禁拦截 —— **可重试**，非确定性拒绝。"""
     return status == 403 and ARGUS_REJECTION_MARKER in str(body or "")
 
 
@@ -793,6 +801,7 @@ def fetch_video_detail(
             headers["Cookie"] = f"ttwid={ttwid}"
     cookie = headers.get("Cookie", "")
 
+    risk_reason = ""
     for aid in _DETAIL_AID_CANDIDATES:
         params = default_query(cookie)
         params.update({"aweme_id": item_id, "aid": aid})
@@ -810,20 +819,22 @@ def fetch_video_detail(
                 raise DouyinAPIError(f"详情请求失败：{e}")
 
             if resp.status_code in _RISK_STATUSES or not resp.text:
-                # Argus 门禁是**确定性**拒绝（请求形状不符），重试 / 等待 /
-                # 重登都无效，只会加速触发验证码。实测 403 body：
-                #   "Blocked by ArgusSecurityPlugin Uifid Not Found"
-                #   "Blocked by ArgusSecurityPlugin Signature Not Found"
+                # Argus 门禁返回的 403（body 含 "ArgusSecurityPlugin"）
+                # 与其他 403 一样是**概率性**的，必须退避重试 —— 实测同一请求
+                # 连续 12 次中 5 次被拦、7 次成功，且连续失败 3 次后重试可成功。
+                # （早期版本把它当确定性拒绝而短路，导致约 40% 请求直接失败。）
                 if _is_argus_rejection(resp.status_code, resp.text):
-                    raise RiskControlError(
-                        f"接口风控（{_argus_marker(resp.text)}）—— "
-                        "请求形状被确定性拒绝，重试 / 重登均无效",
-                        permanent=True)
+                    risk_reason = f"接口风控（{_argus_marker(resp.text)}）"
+                else:
+                    risk_reason = f"接口风控（HTTP {resp.status_code}）"
                 if attempt < max_retries - 1:
                     time.sleep(_RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)])
                     continue
-                raise RiskControlError(
-                    f"接口风控（HTTP {resp.status_code}），请稍后重试或登录后重试")
+                # 当前 aid 重试耗尽：换下一个 aid 再试（不同接口变体，
+                # 命中概率独立），全部耗尽后才上抛。
+                # **不设 permanent**：风控是概率性的，上层「刷新 Cookie
+                # 后重试」同样有机会成功。
+                break
             if resp.status_code != 200:
                 raise DouyinAPIError(f"详情接口 HTTP {resp.status_code}")
 
@@ -849,6 +860,9 @@ def fetch_video_detail(
                 raise RiskControlError("需要登录后才能查看该作品，请先登录")
             break
 
+    # 所有 aid 均因风控失败 → 抛风控（可重试），而不是笼统的「作品可能已删除」
+    if risk_reason:
+        raise RiskControlError(f"{risk_reason}，请稍后重试或登录后重试")
     raise DouyinAPIError("未能获取视频详情（作品可能已删除、私密或需要登录）")
 
 

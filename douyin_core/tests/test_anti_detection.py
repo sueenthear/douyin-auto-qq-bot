@@ -168,10 +168,12 @@ def test_argus_marker_extracts_reason():
     assert douyin_api._argus_marker("") == "ArgusSecurityPlugin"
 
 
-def test_argus_rejection_is_not_retried(monkeypatch):
-    """关键：Argus 确定性拒绝时应立即上抛，不做退避重试。
+def test_argus_rejection_is_retried(monkeypatch):
+    """关键回归：Argus 门禁是**概率性**的，必须退避重试。
 
-    重试只会白耗请求并加速触发验证码。
+    早期版本误判为「确定性拒绝」而短路，导致约 40% 请求直接失败、
+    永不重试（表现为「一旦触发风控，后续都解析不了」）。
+    实测同一请求 12 次中 5 次被拦、7 次成功，重试可突破。
     """
     calls = []
 
@@ -198,8 +200,14 @@ def test_argus_rejection_is_not_retried(monkeypatch):
 
     with pytest.raises(douyin_api.RiskControlError, match="Uifid Not Found"):
         douyin_api.fetch_video_detail("1", cookie="sessionid=x", max_retries=3)
-    assert len(calls) == 1        # 只发一次，未重试
-    assert slept == []            # 未退避
+    # 第一个 aid 重试 3 次，第二个 aid 再 3 次 —— 都会重试
+    assert len(calls) == 6
+    assert len(slept) == 4        # 每个 aid 内部退避两次
+    # 不得标记为 permanent（否则上层不会刷新 Cookie 重试）
+    try:
+        douyin_api.fetch_video_detail("1", cookie="sessionid=x", max_retries=1)
+    except douyin_api.RiskControlError as e:
+        assert getattr(e, "permanent", False) is False
 
 
 def test_plain_403_is_still_retried(monkeypatch):
@@ -229,9 +237,10 @@ def test_plain_403_is_still_retried(monkeypatch):
 
     with pytest.raises(douyin_api.RiskControlError):
         douyin_api.fetch_video_detail("1", cookie="sessionid=x", max_retries=3)
-    # 仅第一个 aid 就走满 3 次尝试（第 3 次判定失败后抛错，不再换 aid）
-    assert len(calls) == 3
-    assert len(slept) == 2        # 中间退避两次
+    # 每个 aid 各重试 3 次，两个 aid 都会走完（换 aid 相当于换接口变体，
+    # 命中概率独立，是提高突破率的合理手段）
+    assert len(calls) == 6
+    assert len(slept) == 4        # 每个 aid 内部退避两次
 
 
 # ---------------------------------------------------------------- msToken 配置

@@ -74,8 +74,9 @@ pip install -r requirements.txt
   "keep_files": false,
   "process_timeout": 300,
   "cookie_refresh_timeout": 60,
-  "risk_retry_attempts": 3,
+  "risk_retry_attempts": 5,
   "risk_retry_interval": 3,
+  "cookie_refresh_after": 3,
   "request_min_interval": 1,
   "request_jitter_ratio": 0.5,
   "proxy": ""
@@ -92,8 +93,9 @@ pip install -r requirements.txt
 | `keep_files` | `false` = 下载到临时目录、发完即删（推荐）；`true` = 保留下载到 `download_dir` |
 | `process_timeout` | 单个作品处理超时（秒） |
 | `cookie_refresh_timeout` | 风控时等待新 Cookie 的上限（秒） |
-| `risk_retry_attempts` | 风控时最多尝试解析的次数（含首次），默认 `3`；设为 `1` 表示不重试 |
+| `risk_retry_attempts` | 风控时最多尝试解析的次数（含首次），默认 `5`（实测单次失败率约 42%，5 次可达 ~98.7% 成功率）；设为 `1` 表示不重试 |
 | `risk_retry_interval` | 风控每次重试前的等待秒数，默认 `3` |
+| `cookie_refresh_after` | 连续风控达到该次数后才刷新 Cookie（要开一次浏览器，代价高），默认 `3`；最小 `2` |
 | `request_min_interval` | **请求节流**：两次抖音请求的最小间隔秒数，默认 `1`；频繁被风控就调大 |
 | `request_jitter_ratio` | 节流的随机抖动比例，默认 `0.5`（实际间隔 = 1.0~1.5 倍） |
 | `proxy` | 代理地址（如 `http://127.0.0.1:7890`），用于规避 IP 风控；空 = 直连 |
@@ -255,7 +257,7 @@ taskkill /F /PID <PID>
 > 不再累积进程。失败/超时仍保留窗口，方便你看页面上的报错。
 
 **解析失败？**
-多为抖音风控或登录失效。程序会静默重拉 Cookie 并重试（默认最多 3 次、间隔 3s）；次数用尽仍失败会回发错误信息并附上触发链接。若频繁失败，跑 `python main.py --login` 重新登录，或调大 `config.json` 的 `risk_retry_attempts`。
+多为抖音风控或登录失效。程序会先**原地重试**（默认最多 5 次、间隔 3s），连续多次风控后才刷新 Cookie；次数用尽仍失败会回发错误信息并附上触发链接。若频繁失败，可调大 `config.json` 的 `risk_retry_attempts`（或 `request_min_interval` 降低请求频率）。
 
 **Bot 频繁断线重连？**
 `config.json` 里 `napcat.read_timeout` 比 NapCat 的心跳间隔小。把它设到心跳的 2~3 倍（心跳 30s → 设 90）。
@@ -404,25 +406,57 @@ mssdk 接口。
 单次请求遇 403/429 时，会在内部按 `1s → 2s → 5s` 退避重试（`_RETRY_DELAYS`），
 再交给上层的「刷新 Cookie 重试」流程。
 
-### 6. Argus 确定性拒绝：立即失败，不做无效重试
+### 6. Argus 门禁：概率性拦截，靠重试突破
 
-`_is_argus_rejection()` 识别 403 body 里的 `ArgusSecurityPlugin` 标记。
-命中时：
+`_is_argus_rejection()` 识别 403 body 里的 `ArgusSecurityPlugin` 标记，
+把具体原因（`Uifid Not Found` / `Signature Not Found`）带进日志。
 
-- **不再退避重试**（此前会白耗 2 次重试 + 2 次退避，增加暴露）
-- **不再开浏览器刷新 Cookie** —— `RiskControlError(permanent=True)` 会让
-  handler 跳过重登。每次刷新都要启一次 Edge，对确定性拒绝毫无帮助，
-  自身反而加重风控。
+**关键（实测）**：这类 403 是**概率性**的，不是确定性拒绝：
+
+```
+实验 A：连续 12 次同样请求
+  UIFID UIFID UIFID UIFID OK OK OK OK UIFID OK OK OK     → 7/12 成功
+实验 B：连续失败 3 次后，第 4 次重试成功                    → 重试确实能突破
+```
+
+单次失败率约 **41.7%**。因此：
+
+- **必须重试**，且重试确实有效
+- 项目内有两层重试叠加：
+  - `fetch_video_detail` 内部：`aid=6383` 与 `aid=1128` 各重试
+    `max_retries` 次（换 aid 相当于换接口变体，命中概率独立）
+  - `handler._parse_with_risk_retry`：默认 5 次尝试，间隔 3 秒
+- 5 次尝试的理论成功率约 **98.7%**（`1 - 0.417⁵`）
+
+> ⚠️ **切勿把它改回「确定性拒绝」短路**。早期版本曾依据
+> 某参考项目的文档判定为确定性拒绝并跳过重试，导致约 40% 的请求
+> 直接失败且永不重试 —— 表现为「一旦触发风控，后续都解析不了」。
+> 该假设已被上表的实测数据推翻。
 
 > 为什么不去「补 uifid」：实测**补了更差**。Cookie 里的 `UIFID` 是 320 字符
 > 加密值，直接填进 query 会让门禁从 `Uifid Not Found` 变成
 > `Signature Not Found`（成功率 3/4 → 1/4）。真正的放行凭据是页面 JS 运行时
 > 生成的 `x-secsdk-web-signature`，纯 HTTP 客户端无法伪造。
-> 参考项目 jiji262/douyin-downloader 的结论相同：它在 CLI 路径放弃解决，
-> 只对 Electron 端（`page_bridge`）用隐藏窗口补这些字段。
-> 故本项目**刻意保持 uifid 为空**（`_extract_uifid` 固定返回 `""`）。
+> 参考项目 jiji262/douyin-downloader 在 CLI 路径同样放弃解决
+> （改为对 Electron 端用隐藏窗口补这些字段）。
+> 故本项目**刻意保持 uifid 为空**（`_extract_uifid` 固定返回 `""`），
+> 转而靠「重试」这一更可靠的手段提高成功率。
 
-### 7. 已移除的失效回退路径
+### 7. 重试与刷新 Cookie 的代价分级
+
+风控重试按代价从低到高，避免动不动就启动浏览器：
+
+| 步骤 | 代价 | 触发条件 |
+|------|------|---------|
+| 1. 直接解析 | 最低 | 每次都试，大部分一次成功 |
+| 2. 原地重试 | 低 | 遇风控即重试（间隔 `risk_retry_interval`） |
+| 3. 刷新 Cookie | **高**（要开一次浏览器） | 连续 `cookie_refresh_after` 次风控后才做 |
+| 4. 回发报错 | — | 尝试用尽仍失败，附触发链接 |
+
+早期版本缺第 2 步：每次风控都直接开浏览器刷新 Cookie，既慢又因频繁
+启动浏览器而加重风控。
+
+### 8. 已移除的失效回退路径
 
 `_fetch_info()` 曾有三条回退，2026-09 实测后两条已彻底失效并摘除：
 
@@ -438,36 +472,45 @@ mssdk 接口。
 ### 实测基线
 
 - 未开启节流时，连续解析 4 个作品，第 3 个即触发 403（风控率 25%）
-- 升级后实测：完整解析链路连续 4 次命中 3 次成功；`fetch_video_detail`
-  连续 6 次命中 4 次成功。Argus 是概率性门禁，单次实验波动较大，
-  但命中时**立即失败**（不再空耗重试与浏览器启动）
+- 修复「permanent 短路」后，用真实分享链接实测：
+  - handler 完整流程连续 6 次 → **6/6 成功**（其中 3 次内部触发风控并靠重试突破）
+  - 连续 10 次解析 → **9/10 成功**
+  - 全程**浏览器刷新次数 = 0**（原地重试即可突破，不必动浏览器）
 
 ## 403 风控：静默刷新 Cookie 后重试
 
-解析遇风控（HTTP 403/429、空响应、「需要登录」）时：
+解析遇风控（HTTP 403/429、空响应、「需要登录」）时，按**代价从低到高**处理：
 
 1. **不发任何报错**（「正在解析中……」回执照常发）
-2. 启动浏览器复用 `.browser_profile` **重新拉取一次 Cookie**
-   （profile 内已有登录态，通常无需重新扫码），同步给解析器
-3. 等待 `risk_retry_interval` 后重试；**最多尝试 `risk_retry_attempts` 次**
-4. 次数用尽仍失败，才发报错并附上触发链接
+2. **原地重试**：等待 `risk_retry_interval` 后直接重试，**不开浏览器**
+   （实测风控是概率性的，重试即可突破 —— 见上一节第 6 条）
+3. 连续风控达到 `cookie_refresh_after` 次后，才启动浏览器复用
+   `.browser_profile` 重新拉取 Cookie（profile 内已有登录态，通常无需重新扫码）
+4. 尝试用尽仍失败，才发报错并附上触发链接
 
-默认最多尝试 **3 次**、每次重试前等待 **3 秒**，可在 `config.json` 调整：
+默认最多尝试 **5 次**、每次重试前等待 **3 秒**、连续 **3** 次风控才刷新 Cookie：
 
 ```json
 {
-  "risk_retry_attempts": 3,
-  "risk_retry_interval": 3
+  "risk_retry_attempts": 5,
+  "risk_retry_interval": 3,
+  "cookie_refresh_after": 3
 }
 ```
 
 日志形如：
 
 ```
-[风控] 第 1/3 次触发（接口风控（HTTP 403）） —— 刷新 Cookie 后重试
+[风控] 第 1/5 次触发（接口风控（Uifid Not Found）） —— 直接重试
+[风控] 第 2/5 次触发（接口风控（Uifid Not Found）） —— 直接重试
+[风控] 第 3/5 次尝试解析成功
+```
+
+只有连续多次风控时才会看到浏览器刷新：
+
+```
+[风控] 连续 3 次触发（接口风控（HTTP 403）） —— 刷新 Cookie 后重试
 [风控] 已重新拉取并保存 Cookie
-[风控] 第 2/3 次触发（接口风控（HTTP 403）） —— 刷新 Cookie 后重试
-[风控] 第 3/3 次尝试解析成功
 ```
 
 若期间遇到非风控错误（如作品已删除），会立即返回该错误、不再重试。

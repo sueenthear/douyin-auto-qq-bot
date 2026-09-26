@@ -53,9 +53,19 @@ BACKEND_NAPCAT = "napcat"
 BACKEND_SNOWLUMA = "snowluma"
 BACKEND_CHOICES = (BACKEND_AUTO, BACKEND_NAPCAT, BACKEND_SNOWLUMA)
 
-# 风控重试默认值：最多尝试 3 次（含首次），每次重试前等待 3 秒
-DEFAULT_RISK_ATTEMPTS = 3
+# 风控重试默认值。
+#
+# 为什么是 5 次而非 3 次：实测 Argus 门禁（Uifid Not Found）单次失败率约
+# **41.7%**（12 次同样请求中 5 次被拦），是概率性的、且重试可突破。
+#   3 次 → 成功率 92.77%
+#   5 次 → 成功率 98.74%
+# 配合 fetch_video_detail 内部的 aid 维度重试，实际更稳。
+# 每次等待 3 秒：退避太短会持续撞上同一批被拦请求。
+DEFAULT_RISK_ATTEMPTS = 5
 DEFAULT_RISK_INTERVAL = 3.0
+# 连续风控达到该次数后，才尝试「刷新 Cookie」（要开一次浏览器，代价高）。
+# Argus 门禁是概率性的，仅靠原地重试即可突破，不必每次都动浏览器。
+DEFAULT_REFRESH_AFTER = 3
 
 DEFAULT_MESSAGES = {
     "video": "检测到抖音视频分享链接，正在解析中……",
@@ -164,6 +174,8 @@ class BotConfig:
     # 风控重试：最多尝试解析的次数（含首次）与每次重试前的等待（秒）
     risk_retry_attempts: int = DEFAULT_RISK_ATTEMPTS
     risk_retry_interval: float = DEFAULT_RISK_INTERVAL
+    # 连续风控达到该次数后，才值得开浏览器刷新 Cookie（代价高）
+    cookie_refresh_after: int = DEFAULT_REFRESH_AFTER
     # 请求节流（防频率风控）：最小请求间隔与随机抖动比例
     request_min_interval: float = 1.0
     request_jitter_ratio: float = 0.5
@@ -265,6 +277,9 @@ def load_config(config_path: str = DEFAULT_CONFIG_FILE,
     cfg.risk_retry_interval = max(0.0, _as_float(
         data.get("risk_retry_interval"), "risk_retry_interval",
         DEFAULT_RISK_INTERVAL))
+    cfg.cookie_refresh_after = max(2, _as_int(
+        data.get("cookie_refresh_after"), "cookie_refresh_after",
+        DEFAULT_REFRESH_AFTER))
     cfg.request_min_interval = max(0.0, _as_float(
         data.get("request_min_interval"), "request_min_interval", 1.0))
     cfg.request_jitter_ratio = max(0.0, _as_float(

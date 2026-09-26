@@ -18,6 +18,7 @@ class FakeConfig:
     download_dir = "downloads"
     risk_retry_attempts = 3          # 最多尝试 3 次（含首次）
     risk_retry_interval = 0.0        # 测试中不真等待
+    cookie_refresh_after = 3         # 连续风控 3 次才刷新 Cookie
 
     def __init__(self):
         self.messages = {
@@ -84,48 +85,47 @@ def test_normal_parse_no_refresh():
     assert bot.refreshed == 0          # 未触发风控 → 不刷新 Cookie
 
 
-# ---------------------------------------------------------------- 风控重试（默认 3 次 / 间隔 3s）
+# ---------------------------------------------------------------- 风控重试
 
-def test_risk_control_refresh_then_success():
-    """第 2 次就成功：只刷新 1 次 Cookie，共解析 2 次。"""
+def test_risk_control_succeeds_on_second_attempt():
+    """第 2 次就成功：原地重试即突破，不开浏览器。"""
     info = VideoInfo(item_id="1", title="魔女之夜", play_url="http://x")
     bot = make_bot([RiskControlError("接口风控（HTTP 403）"), info])
     got, err = bot._parse_with_risk_retry(SHARE)
     assert got is info and err == ""
-    assert bot.refreshed == 1
+    assert bot.refreshed == 0          # 未刷新 Cookie
     assert bot.parser.calls == 2
 
 
 def test_risk_control_succeeds_on_third_attempt():
-    """第 3 次才成功：刷新 2 次，共解析 3 次。"""
+    """第 3 次成功：仍未达到刷新阈值，不刷新 Cookie。"""
     info = VideoInfo(item_id="1", play_url="http://x")
-    bot = make_bot([RiskControlError("403"), RiskControlError("403"), info])
+    bot = make_bot([RiskControlError("403"), RiskControlError("403"), info],
+                   attempts=5)
     got, err = bot._parse_with_risk_retry(SHARE)
     assert got is info and err == ""
-    assert bot.refreshed == 2
+    assert bot.refreshed == 0
     assert bot.parser.calls == 3
 
 
-def test_risk_control_exhausts_three_attempts():
-    """持续风控：共解析 3 次、刷新 2 次（第 3 次失败后不再刷新）。"""
-    bot = make_bot([RiskControlError("403"), RiskControlError("403"),
-                    RiskControlError("接口风控（HTTP 403）")])
+def test_risk_control_exhausts_attempts():
+    """持续风控：用尽 attempts 后报错，且不多开浏览器。"""
+    bot = make_bot([RiskControlError("403")] * 5, attempts=5)
     got, err = bot._parse_with_risk_retry(SHARE)
     assert got is None
-    assert bot.parser.calls == 3
-    assert bot.refreshed == 2
+    assert bot.parser.calls == 5
     assert "风控" in err
     assert URL in err
 
 
 def test_risk_retry_interval_is_waited(monkeypatch):
-    """重试前确实等待了配置的间隔（3s）。"""
+    """重试前确实等待了配置的间隔。"""
     slept = []
     monkeypatch.setattr("qq_bot.handler.time.sleep",
                         lambda s: slept.append(s))
     info = VideoInfo(item_id="1", play_url="http://x")
     bot = make_bot([RiskControlError("403"), RiskControlError("403"), info],
-                   interval=3.0)
+                   attempts=5, interval=3.0)
     got, _ = bot._parse_with_risk_retry(SHARE)
     assert got is info
     assert slept == [3.0, 3.0]        # 两次重试各等 3 秒
@@ -142,7 +142,7 @@ def test_risk_retry_attempts_configurable():
 
 
 def test_risk_control_does_not_leak_error_message():
-    """风控首次失败时不应产生报错文案（由调用方决定是否发送）。"""
+    """风控未最终失败时不应产生报错文案（由调用方决定是否发送）。"""
     info = VideoInfo(item_id="1", play_url="http://x")
     bot = make_bot([RiskControlError("403"), info])
     _, err = bot._parse_with_risk_retry(SHARE)
@@ -153,8 +153,7 @@ def test_risk_control_does_not_leak_error_message():
 
 def test_risk_control_persists_reports_with_link():
     """持续风控：报错文案必须带触发链接。"""
-    bot = make_bot([RiskControlError("403"), RiskControlError("403"),
-                    RiskControlError("接口风控（HTTP 403）")])
+    bot = make_bot([RiskControlError("403")] * 5, attempts=5)
     got, err = bot._parse_with_risk_retry(SHARE)
     assert got is None
     assert "风控" in err
@@ -162,7 +161,10 @@ def test_risk_control_persists_reports_with_link():
 
 
 def test_risk_refresh_failure_reports_with_link():
-    bot = make_bot([RiskControlError("403")], refresh_ok=False)
+    """刷新 Cookie 本身失败时，报错也要带链接。"""
+    # 连续 3 次风控触发刷新，而刷新失败 → 立即返回
+    bot = make_bot([RiskControlError("403")] * 4, refresh_ok=False,
+                   attempts=6)
     got, err = bot._parse_with_risk_retry(SHARE)
     assert got is None
     assert "刷新 Cookie 失败" in err
@@ -258,41 +260,71 @@ def test_risk_after_refresh_but_other_error():
 
 # ---------------------------------------------------------------- 确定性拒绝
 
-def test_permanent_risk_skips_refresh_and_retry():
-    """Argus 门禁等确定性拒绝：不刷新 Cookie、不重试，只解析一次。
+def test_risk_retries_in_place_before_refreshing_cookie():
+    """关键回归：风控应先「原地重试」，而不是每次都开浏览器刷新 Cookie。
 
-    每次刷新都要开一次浏览器，本身会加重风控 —— 对确定性拒绝毫无帮助。
+    实测 Argus 门禁是概率性的（单次失败率 ~42%），靠重试即可突破；
+    每次风控都开浏览器既慢又加重风控。
     """
-    bot = make_bot([RiskControlError("Uifid Not Found", permanent=True),
-                    VideoInfo(item_id="1", play_url="http://x")])
+    info = VideoInfo(item_id="1", play_url="http://x")
+    # 前两次风控，第三次成功
+    bot = make_bot([RiskControlError("Uifid Not Found"),
+                    RiskControlError("Uifid Not Found"), info], attempts=5)
+    got, _ = bot._parse_with_risk_retry(SHARE)
+    assert got is info
+    assert bot.parser.calls == 3
+    assert bot.refreshed == 0          # 未开浏览器就突破了
+
+
+def test_risk_control_error_alone_no_longer_fails_permanently():
+    """回归：单次风控不应被当作「确定性拒绝」直接判死。
+
+    早期版本把 Uifid Not Found 当 permanent 短路，导致约 40% 请求
+    直接失败且永不重试（表现为「一旦触发风控，后续都解析不了」）。
+    """
+    info = VideoInfo(item_id="1", play_url="http://x")
+    bot = make_bot([RiskControlError("接口风控（Uifid Not Found）"), info],
+                   attempts=5)
+    got, err = bot._parse_with_risk_retry(SHARE)
+    assert got is info                 # 第二次成功
+    assert err == ""
+    assert bot.parser.calls == 2
+
+
+def test_refresh_happens_after_consecutive_risks():
+    """连续多次风控后才刷新 Cookie（代价高的兜底手段）。"""
+    info = VideoInfo(item_id="1", play_url="http://x")
+    # 连续 3 次风控 → 触发刷新；第 4 次成功
+    bot = make_bot([RiskControlError("403"), RiskControlError("403"),
+                    RiskControlError("403"), info], attempts=6)
+    got, _ = bot._parse_with_risk_retry(SHARE)
+    assert got is info
+    assert bot.refreshed == 1
+    assert bot.parser.calls == 4
+
+
+def test_refresh_counter_resets_after_refresh():
+    """刷新 Cookie 后计数归零，避免连续两次都触发刷新。"""
+    info = VideoInfo(item_id="1", play_url="http://x")
+    bot = make_bot([RiskControlError("403")] * 3 + [RiskControlError("403"),
+                                                    info], attempts=8)
+    got, _ = bot._parse_with_risk_retry(SHARE)
+    assert got is info
+    assert bot.refreshed == 1          # 只刷新一次
+
+
+def test_risk_exhausts_attempts_and_reports_link():
+    """尝试用尽仍失败 → 报错含原因与触发链接。"""
+    bot = make_bot([RiskControlError("Uifid Not Found")] * 6, attempts=5)
     got, err = bot._parse_with_risk_retry(SHARE)
     assert got is None
-    assert bot.parser.calls == 1        # 只解析一次，未重试
-    assert bot.refreshed == 0           # 未开浏览器刷新 Cookie
+    assert bot.parser.calls == 5
     assert "Uifid Not Found" in err
     assert URL in err
 
 
-def test_permanent_risk_is_checked_even_on_last_attempt():
-    """permanent 判定应先于 attempts 用尽判断（第 1 次即返回）。"""
-    bot = make_bot([RiskControlError("Signature Not Found", permanent=True)],
-                   attempts=5)
-    got, err = bot._parse_with_risk_retry(SHARE)
-    assert got is None
-    assert bot.parser.calls == 1
-    assert bot.refreshed == 0
-
-
-def test_transient_risk_still_refreshes():
-    """对照：普通（非 permanent）风控仍走「刷新 Cookie 后重试」。"""
-    info = VideoInfo(item_id="1", play_url="http://x")
-    bot = make_bot([RiskControlError("HTTP 403"), info])
-    got, _ = bot._parse_with_risk_retry(SHARE)
-    assert got is info
-    assert bot.refreshed == 1
-
-
 def test_risk_control_permanent_flag_defaults_false():
+    """permanent 标记默认 False（保留字段但不用于短路）。"""
     assert RiskControlError("403").permanent is False
     assert RiskControlError("403", permanent=True).permanent is True
 

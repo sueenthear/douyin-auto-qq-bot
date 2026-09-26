@@ -224,10 +224,18 @@ class DouyinQQBot:
     # ------------------------------------------------------------ 风控重试
 
     def _parse_with_risk_retry(self, text: str):
-        """解析作品；遇风控则刷新 Cookie 并重试，最多尝试 N 次（默认 3）。
+        """解析作品；遇风控则重试，必要时刷新 Cookie。
 
-        流程：解析 → 若风控则「刷新 Cookie + 等待间隔」→ 重试 …… 直到成功、
-        次数用尽，或遇到非风控错误。期间不发任何报错（静默重试）。
+        流程（按代价递增）：
+          1. 直接解析 —— 大部分请求一次就成功
+          2. 遇风控 → 短暂等待后**原地重试**（不开浏览器）。实测 Argus 门禁是
+             概率性的：同一请求 12 次中 5 次被拦，且连续失败 3 次后重试可成功。
+             重试几乎总能突破，且零额外副作用。
+          3. 连续多次风控 → 才尝试「刷新 Cookie」（代价高：要开一次浏览器）
+          4. 仍失败 → 回发报错并附触发链接
+
+        早期版本第 2 步缺失：每次风控都直接开浏览器刷新 Cookie，既慢又因
+        频繁启动浏览器而加重风控。
 
         :return: (info, "") 成功；(None, 报错文案) 失败
         """
@@ -235,6 +243,9 @@ class DouyinQQBot:
         interval = max(0.0, getattr(self.config, "risk_retry_interval", 3.0))
         url = extract_share_url(text) or ""
         last_reason = ""
+        # 连续风控达到该次数后才值得开浏览器刷新 Cookie（代价高）
+        refresh_after = max(2, getattr(self.config, "cookie_refresh_after", 3))
+        risk_hits = 0
 
         for attempt in range(1, attempts + 1):
             try:
@@ -244,18 +255,24 @@ class DouyinQQBot:
                 return info, ""
             except RiskControlError as e:
                 last_reason = str(e)
-                # Argus 门禁等确定性拒绝：刷新 Cookie / 重登都不会改变结果，
-                # 每次重试却要多开一次浏览器（本身会加重风控），故直接失败。
-                if getattr(e, "permanent", False):
-                    self.log(f"[风控] 确定性拒绝，跳过重试：{e}")
-                    return None, self._risk_message(url, last_reason)
+                risk_hits += 1
                 if attempt >= attempts:
                     break
-                # 风控：不发报错，先静默尝试重新拉取 Cookie
-                self.log(f"[风控] 第 {attempt}/{attempts} 次触发（{e}）"
+
+                # 先原地重试：概率性风控靠重试即可突破，且不开浏览器
+                if risk_hits < refresh_after:
+                    self.log(f"[风控] 第 {attempt}/{attempts} 次触发（{e}）"
+                             f" —— 直接重试")
+                    if interval:
+                        time.sleep(interval)
+                    continue
+
+                # 连续多次风控：可能是登录态问题，这才值得刷新 Cookie
+                self.log(f"[风控] 连续 {risk_hits} 次触发（{e}）"
                          f" —— 刷新 Cookie 后重试")
                 if not self._refresh_cookie():
                     return None, self._risk_message(url, "刷新 Cookie 失败")
+                risk_hits = 0               # 刷新后重新计数
                 if interval:
                     time.sleep(interval)
             except ParseError as e:
