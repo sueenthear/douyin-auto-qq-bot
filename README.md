@@ -293,10 +293,19 @@ python -m pytest douyin_core/tests qq_bot/tests -q
 
 ## 防风控措施
 
-抖音对**请求频率**很敏感：连续解析几个作品就会返回
-`403 Blocked by ArgusSecurityPlugin`。项目内置以下措施：
+抖音 2026-08 起上线 **ArgusSecurityPlugin** 门禁，对**请求形状**（签名、
+指纹、参数自洽性）做校验，命中即返回：
 
-### 1. 请求节流（最有效）
+```
+HTTP 403  Blocked by ArgusSecurityPlugin Uifid Not Found
+HTTP 403  Blocked by ArgusSecurityPlugin Signature Not Found
+```
+
+**关键认知**：这类 403 与「频率风控」性质不同 —— 它是**确定性拒绝**，
+重试 / 退避 / 重新登录都无效，反而会加速触发验证码。因此本项目把它与
+普通风控区分处理（见下文第 6 条）。
+
+### 1. 请求节流
 
 所有对抖音的请求共享一个全局最小间隔，并叠加随机抖动，避免突发流量：
 
@@ -313,14 +322,35 @@ python -m pytest douyin_core/tests qq_bot/tests -q
 
 **觉得还是频繁被风控，就调大这两个值**（例如 `2` / `1.0`）。这是最直接的手段。
 
-### 2. msToken 缓存
+### 2. UA 与浏览器指纹全程固定且自洽
 
-`default_query()` 原本每次调用都会打一次 `mssdk` 接口换取 msToken ——
-即**每个作品解析都多一次请求**，请求量翻倍且更易触发风控。
+a_bogus 签名把 UA 作为加密输入，且指纹与 query 参数必须来自同一「浏览器」。
 
-现在生成结果会缓存 30 分钟（`_MS_TOKEN_TTL`），同一会话内只请求一次。
+- **UA 池**（`_UA_POOL`）：首次使用时随机选定一个，**之后全程固定**。
+  不能每请求轮换 —— 那会造成「签名用 A、请求头用 B」的自相矛盾。
+- **指纹自洽**：`default_query()` 的 `screen_width` / `screen_height` /
+  `browser_platform` 等一律**取自签名指纹本身**，而不是写死值。
 
-### 3. 代理支持
+> 修复前 query 固定 `1536x864`，而签名指纹每次随机（如 `1881x876`）——
+> 真实浏览器不可能出现这种组合，本身就是脚本特征。
+
+### 3. 真实 msToken（远程配置 + 回退快照）
+
+mssdk 生成 msToken 需要一份 `magic` / `strData` 配置，该配置会随抖音更新
+失效。内置快照实测已过期（`resultCode: -6`），会导致真实 token **永远生成
+失败、静默退化为随机占位**。
+
+现在优先远程拉取 F2 的 `conf.yaml`（社区持续更新），失败则回退内置快照或
+上次成功值，并带 1 小时缓存 / 失败后 5 分钟退避：
+
+```
+真实 msToken 生成本身没问题，问题只在配置过期；远程拉取后可稳定生成 len=184 的 token
+```
+
+msToken 结果自身也缓存 30 分钟（`_MS_TOKEN_TTL`），避免每个作品都多打一次
+mssdk 接口。
+
+### 4. 代理支持
 
 `config.json` 里配置代理可规避 **IP 维度**的风控：
 
@@ -332,20 +362,48 @@ python -m pytest douyin_core/tests qq_bot/tests -q
 
 留空表示直连。配置后，详情请求与 ttwid 注册都会走该代理。
 
-### 4. 指数退避重试
+### 5. 指数退避重试（仅对可恢复的风控）
 
 单次请求遇 403/429 时，会在内部按 `1s → 2s → 5s` 退避重试（`_RETRY_DELAYS`），
 再交给上层的「刷新 Cookie 重试」流程。
 
-### 5. 风控后自动重登
+### 6. Argus 确定性拒绝：立即失败，不做无效重试
 
-见下一节。**注意顺序**：先靠节流「少触发」，触发后才走重登兜底 ——
-频繁重登（每次都会开一次浏览器）本身也会加重风控。
+`_is_argus_rejection()` 识别 403 body 里的 `ArgusSecurityPlugin` 标记。
+命中时：
+
+- **不再退避重试**（此前会白耗 2 次重试 + 2 次退避，增加暴露）
+- **不再开浏览器刷新 Cookie** —— `RiskControlError(permanent=True)` 会让
+  handler 跳过重登。每次刷新都要启一次 Edge，对确定性拒绝毫无帮助，
+  自身反而加重风控。
+
+> 为什么不去「补 uifid」：实测**补了更差**。Cookie 里的 `UIFID` 是 320 字符
+> 加密值，直接填进 query 会让门禁从 `Uifid Not Found` 变成
+> `Signature Not Found`（成功率 3/4 → 1/4）。真正的放行凭据是页面 JS 运行时
+> 生成的 `x-secsdk-web-signature`，纯 HTTP 客户端无法伪造。
+> 参考项目 jiji262/douyin-downloader 的结论相同：它在 CLI 路径放弃解决，
+> 只对 Electron 端（`page_bridge`）用隐藏窗口补这些字段。
+> 故本项目**刻意保持 uifid 为空**（`_extract_uifid` 固定返回 `""`）。
+
+### 7. 已移除的失效回退路径
+
+`_fetch_info()` 曾有三条回退，2026-09 实测后两条已彻底失效并摘除：
+
+| 路径 | 实测结果 |
+|------|---------|
+| iesdouyin `iteminfo` | 恒返回 `status_code=11110 / encrypt_data_miss`，接口已废弃 |
+| 详情页 HTML | 页面不再内嵌 `aweme_detail` / `play_addr`（`_ROUTER_DATA` 消失，`RENDER_DATA` 只剩框架数据） |
+
+摘除的理由不只是「没用」：它们各发一次注定失败的请求（增加风控暴露面），
+并把风控错误降级成误导性的「作品可能已删除」。两者仍保留为方法，
+但不再进入回退链。
 
 ### 实测基线
 
-未开启节流时，连续解析 4 个作品，第 3 个即触发 403（风控率 25%）。
-节流生效后请求被拉平，触发概率显著下降。
+- 未开启节流时，连续解析 4 个作品，第 3 个即触发 403（风控率 25%）
+- 升级后实测：完整解析链路连续 4 次命中 3 次成功；`fetch_video_detail`
+  连续 6 次命中 4 次成功。Argus 是概率性门禁，单次实验波动较大，
+  但命中时**立即失败**（不再空耗重试与浏览器启动）
 
 ## 403 风控：静默刷新 Cookie 后重试
 

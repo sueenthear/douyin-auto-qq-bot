@@ -244,6 +244,11 @@ class DouyinQQBot:
                 return info, ""
             except RiskControlError as e:
                 last_reason = str(e)
+                # Argus 门禁等确定性拒绝：刷新 Cookie / 重登都不会改变结果，
+                # 每次重试却要多开一次浏览器（本身会加重风控），故直接失败。
+                if getattr(e, "permanent", False):
+                    self.log(f"[风控] 确定性拒绝，跳过重试：{e}")
+                    return None, self._risk_message(url, last_reason)
                 if attempt >= attempts:
                     break
                 # 风控：不发报错，先静默尝试重新拉取 Cookie

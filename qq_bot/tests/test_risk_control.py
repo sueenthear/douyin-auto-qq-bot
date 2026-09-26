@@ -256,6 +256,47 @@ def test_risk_after_refresh_but_other_error():
     assert bot.parser.calls == 2       # 第二次就返回，不再重试
 
 
+# ---------------------------------------------------------------- 确定性拒绝
+
+def test_permanent_risk_skips_refresh_and_retry():
+    """Argus 门禁等确定性拒绝：不刷新 Cookie、不重试，只解析一次。
+
+    每次刷新都要开一次浏览器，本身会加重风控 —— 对确定性拒绝毫无帮助。
+    """
+    bot = make_bot([RiskControlError("Uifid Not Found", permanent=True),
+                    VideoInfo(item_id="1", play_url="http://x")])
+    got, err = bot._parse_with_risk_retry(SHARE)
+    assert got is None
+    assert bot.parser.calls == 1        # 只解析一次，未重试
+    assert bot.refreshed == 0           # 未开浏览器刷新 Cookie
+    assert "Uifid Not Found" in err
+    assert URL in err
+
+
+def test_permanent_risk_is_checked_even_on_last_attempt():
+    """permanent 判定应先于 attempts 用尽判断（第 1 次即返回）。"""
+    bot = make_bot([RiskControlError("Signature Not Found", permanent=True)],
+                   attempts=5)
+    got, err = bot._parse_with_risk_retry(SHARE)
+    assert got is None
+    assert bot.parser.calls == 1
+    assert bot.refreshed == 0
+
+
+def test_transient_risk_still_refreshes():
+    """对照：普通（非 permanent）风控仍走「刷新 Cookie 后重试」。"""
+    info = VideoInfo(item_id="1", play_url="http://x")
+    bot = make_bot([RiskControlError("HTTP 403"), info])
+    got, _ = bot._parse_with_risk_retry(SHARE)
+    assert got is info
+    assert bot.refreshed == 1
+
+
+def test_risk_control_permanent_flag_defaults_false():
+    assert RiskControlError("403").permanent is False
+    assert RiskControlError("403", permanent=True).permanent is True
+
+
 # ---------------------------------------------------------------- 异常层级
 
 def test_risk_control_error_is_douyin_api_error():

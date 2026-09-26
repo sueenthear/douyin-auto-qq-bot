@@ -3,13 +3,16 @@
 douyin_api.py — 抖音网页版官方 Web API 客户端（requests 同步版）
 
 参考实现思路来自 jiji262/douyin-downloader（MIT）与 F2（Apache-2.0）：
-  * 完整浏览器环境参数（aid/version_code/screen 等）——缺失会被风控拒绝
-  * msToken：优先使用 Cookie 中的；否则调 mssdk 接口生成；失败用随机占位
-  * X-Bogus 签名（见 xbogus.py），签名与 User-Agent 绑定，请求必须同 UA
-  * 详情接口 /aweme/v1/web/aweme/detail/ 依次尝试 aid=6383（视频/图文）与
-    aid=1128（仅视频）；403/429/空响应视为风控，指数退避重试
+  * 完整浏览器环境参数（aid/version_code/screen 等）——缺失会被风控拒绝；
+    **屏幕/平台等参数取自签名指纹本身**，保证与 a_bogus 自洽
+  * UA 池：首次使用随机选定后全程固定（签名与请求头必须同 UA）
+  * msToken：Cookie 中的 → 缓存 → 远程 F2 配置生成 → 内置快照 → 随机占位
+  * a_bogus 签名（见 abogus.py）优先，X-Bogus 兜底；签名与 UA 绑定
+  * 详情接口 /aweme/v1/web/aweme/detail/ 依次尝试 aid=6383 与 aid=1128
   * 风控 / 需登录时抛 ``RiskControlError``（DouyinAPIError 子类），
     便于上层「刷新 Cookie 后重试」；其余失败抛 ``DouyinAPIError``
+  * **Argus 门禁**（2026-08 起）返回 403 ``Blocked by ArgusSecurityPlugin``，
+    属确定性拒绝 —— 不再退避重试，并以 ``permanent=True`` 通知上层跳过重登
   * 无水印地址：bit_rate 阶梯取最高画质 → 直连 CDN 优先 → 签名 play 端点
     兜底 → playwm 替换最后兜底
 """
@@ -38,12 +41,119 @@ except Exception:  # pragma: no cover - 可选依赖（gmssl）
 
 _BASE_URL = "https://www.douyin.com"
 
-# 签名与 UA 绑定：全局固定 UA，保证签名、请求、下载三处一致
-_UA = (
+# UA 池：启动（首次使用时）随机选一个，之后**全程固定**。
+#
+# 为什么必须固定而不能每请求轮换：a_bogus 签名把 UA 作为输入参与加密
+# （abogus.py: rc4_encrypt(ua_key, user_agent)），签名与请求头 UA 必须严格
+# 一致；同时该 UA 还决定浏览器指纹里的平台。若每请求换 UA，就会出现
+# 「签名用 A、请求头用 B」的自相矛盾，反而更容易被 Argus 判定为脚本。
+#
+# 参考 jiji262/douyin-downloader：它在客户端初始化时 random.choice 选一次
+# 并贯穿生命周期，本项目采用同一策略。
+_UA_POOL = (
+    # Windows / Chrome
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+    # macOS / Chrome
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
 )
-_USER_AGENTS = [_UA]
+
+# 当前固定 UA：首次使用时从池中随机选定，之后不变（可用 set_user_agent 覆盖）
+_UA = _UA_POOL[0]
+_UA_LOCK = threading.Lock()
+_UA_FIXED = False
+
+# 签名指纹：与 UA 同源、同样全程固定。
+#
+# 关键：query 里的 screen_width/screen_height 等硬件参数必须与签名指纹
+# **来自同一次生成**，否则两者互相矛盾（如 query 写 1536x864、指纹随机出
+# 1881x876），与真实浏览器的自洽性相悖，会成为识别脚本的特征。
+# 参考项目即用 BrowserFingerprintGenerator 生成一次后复用。
+_BROWSER_FP = ""
+# 从指纹串解析出的屏幕/窗口尺寸，供 default_query 使用
+_FP_GEOMETRY: Dict[str, int] = {}
+
+
+def _fp_platform(ua: str) -> str:
+    """按 UA 推断 navigator.platform（指纹末段）。"""
+    if "Macintosh" in ua or "Mac OS X" in ua:
+        return "MacIntel"
+    return "Win32"
+
+
+def _parse_fp_geometry(fp: str) -> Dict[str, int]:
+    """解析指纹串里的几何值，供 query 参数复用。
+
+    指纹段序（abogus.BrowserFingerprintGenerator._generate_fingerprint）::
+
+        0 innerW | 1 innerH | 2 outerW | 3 outerH | 4 screenX | 5 screenY
+        6 0 | 7 0 | 8 screenW | 9 screenH | 10 availW | 11 availH
+        12 innerW | 13 innerH | 14 24 | 15 24 | 16 platform
+    """
+    parts = fp.split("|")
+    if len(parts) < 16:
+        return {}
+    try:
+        return {
+            "inner_width": int(parts[0]),
+            "inner_height": int(parts[1]),
+            "screen_width": int(parts[8]),
+            "screen_height": int(parts[9]),
+        }
+    except (TypeError, ValueError):
+        return {}
+
+
+def _ensure_profile(preserve_ua: bool = False) -> None:
+    """首次调用时固定 UA 与浏览器指纹。线程安全、幂等。
+
+    :param preserve_ua: True 时保留当前 ``_UA``（由 set_user_agent 显式指定），
+                        只重算指纹。
+    """
+    global _UA, _UA_FIXED, _BROWSER_FP, _FP_GEOMETRY
+    if _UA_FIXED:
+        return
+    with _UA_LOCK:
+        if _UA_FIXED:
+            return
+        if not preserve_ua:
+            _UA = random.choice(_UA_POOL)
+        # 指纹与 UA 必须同源：先按 UA 定平台，再生成对应指纹
+        if BrowserFingerprintGenerator is not None:
+            try:
+                _BROWSER_FP = BrowserFingerprintGenerator.generate_fingerprint(
+                    "Chrome" if "Chrome/" in _UA else "Edge")
+            except Exception:
+                _BROWSER_FP = ""
+        # Chrome/macOS 的指纹平台需与 UA 一致
+        if _BROWSER_FP and "Macintosh" in _UA:
+            _BROWSER_FP = _BROWSER_FP.rsplit("|", 1)[0] + "|MacIntel"
+        _FP_GEOMETRY = _parse_fp_geometry(_BROWSER_FP)
+        _UA_FIXED = True
+
+
+def set_user_agent(ua: str = "") -> str:
+    """显式指定/重置固定 UA；传空串则重新随机选定。返回生效的 UA。
+
+    会连带按新 UA 重新生成指纹，保证「签名 UA == 请求头 UA」且指纹与之一致。
+    """
+    global _UA, _UA_FIXED, _BROWSER_FP, _FP_GEOMETRY
+    chosen = str(ua or "").strip() or random.choice(_UA_POOL)
+    with _UA_LOCK:
+        _UA = chosen
+        _BROWSER_FP = ""
+        _FP_GEOMETRY = {}
+        _UA_FIXED = False          # 触发下面的指纹重算
+    _ensure_profile(preserve_ua=True)
+    return _UA
+
+
+def current_user_agent() -> str:
+    """当前固定 UA（会触发首次初始化）。"""
+    _ensure_profile()
+    return _UA
+
 
 # detail 接口的 aid 候选：6383 覆盖视频+图文，1128 仅视频（互相补充）
 _DETAIL_AID_CANDIDATES = ("6383", "1128")
@@ -218,7 +328,40 @@ class RiskControlError(DouyinAPIError):
 
     涵盖：403 / 429 / 空响应（风控拦截）、「需要登录后才能查看」等。
     与普通 DouyinAPIError 区分开，便于上层自动重登重试。
+
+    :param permanent: True 表示**确定性拒绝**（如 Argus 门禁），
+        重试 / 重登 / 等待都无效。上层据此跳过「开浏览器刷新 Cookie」
+        这类无效且会加重风控的动作。
     """
+
+    def __init__(self, message: str, permanent: bool = False):
+        super().__init__(message)
+        self.permanent = permanent
+
+
+# ---------------------------------------------------------------- Argus 门禁
+
+# 抖音 2026-08 起上线的 ArgusSecurityPlugin 门禁。命中时 HTTP 403，
+# body 形如 "Blocked by ArgusSecurityPlugin Uifid Not Found" /
+# "... Signature Not Found"。
+#
+# 关键区别：这类 403 是**确定性**的（请求形状不符），不是频率风控。
+# 重试 / 等退避 / 重新登录都无法通过，反而会加速触发验证码。
+ARGUS_REJECTION_MARKER = "ArgusSecurityPlugin"
+
+
+def _argus_marker(body: str) -> str:
+    """从 403 body 中提取 Argus 的具体拒绝原因，便于日志定位。"""
+    text = str(body or "")
+    if ARGUS_REJECTION_MARKER not in text:
+        return "ArgusSecurityPlugin"
+    idx = text.find(ARGUS_REJECTION_MARKER) + len(ARGUS_REJECTION_MARKER)
+    return text[idx:idx + 40].strip() or ARGUS_REJECTION_MARKER
+
+
+def _is_argus_rejection(status: int, body: str) -> bool:
+    """是否为 Argus 门禁的确定性拒绝（重试无意义）。"""
+    return status == 403 and ARGUS_REJECTION_MARKER in str(body or "")
 
 
 # ---------------------------------------------------------------- msToken
@@ -226,6 +369,114 @@ class RiskControlError(DouyinAPIError):
 # msToken 缓存：避免每个作品解析都多打一次 mssdk 接口
 _ms_token_cache: tuple = ("", 0.0)
 _MS_TOKEN_TTL = 1800.0      # 30 分钟
+
+# ---------------------------------------------------------------- msToken 配置
+#
+# mssdk 生成 msToken 需要一份含 magic / strData 的配置，该配置随抖音更新而
+# 失效。内置快照（_MSSDK_CONF）实测已过期（返回 resultCode: -6），会导致
+# 真实 token 永远生成失败、静默退化为随机占位。
+#
+# 参考 jiji262/douyin-downloader 的做法：优先远程拉取 F2 的 conf.yaml
+# （该文件由社区持续更新），失败则回退内置快照/上次成功值。
+_F2_CONF_URL = (
+    "https://raw.githubusercontent.com/Johnserf-Seed/f2/main/f2/conf/conf.yaml")
+_MSSDK_CONF_REQUIRED = ("url", "magic", "version", "dataType", "ulr", "strData")
+# 配置缓存：成功时缓存 1 小时；失败后退避 5 分钟，避免每次解析都白等超时
+_ms_conf_cache: tuple = ({}, 0.0)
+_ms_conf_retry_after: float = 0.0
+_MS_CONF_TTL = 3600.0
+_MS_CONF_FAIL_BACKOFF = 300.0
+_ms_conf_lock = threading.Lock()
+
+
+def _parse_f2_conf(raw: str) -> Dict[str, Any]:
+    """从 F2 conf.yaml 文本中提取 msToken 配置段。
+
+    只做最小的 YAML 提取（不引入 PyYAML 依赖）：定位
+    ``douyin:`` 下的 ``msToken:`` 块，逐行取 ``key: value``。
+    """
+    try:
+        import yaml  # 可选依赖：装了就精确解析
+        data = yaml.safe_load(raw) or {}
+        conf = ((data.get("f2") or {}).get("douyin") or {}).get("msToken") or {}
+        if isinstance(conf, dict):
+            return conf
+    except Exception:
+        pass
+
+    # 无 PyYAML 时的兜底：按缩进抓 msToken 块
+    lines = str(raw or "").splitlines()
+    start = None
+    base_indent = 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("msToken:") and not stripped.endswith("{}"):
+            start = index
+            base_indent = len(line) - len(line.lstrip())
+            break
+    if start is None:
+        return {}
+
+    conf: Dict[str, Any] = {}
+    for line in lines[start + 1:]:
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= base_indent:
+            break
+        if ":" not in line:
+            continue
+        key, _, value = line.strip().partition(":")
+        value = value.strip().strip('"').strip("'")
+        if value:
+            conf[key] = value
+    # 数值字段转回 int（YAML 里是裸数字，兜底路径拿到的是字符串）
+    for key in ("magic", "version", "dataType", "ulr"):
+        if key in conf:
+            try:
+                conf[key] = int(conf[key])
+            except (TypeError, ValueError):
+                conf.pop(key, None)
+    return conf
+
+
+def _fetch_remote_ms_conf(timeout: float = 5.0) -> Dict[str, Any]:
+    """远程拉取 F2 配置；失败返回 {}。"""
+    try:
+        resp = requests.get(_F2_CONF_URL, timeout=timeout, proxies=_proxies())
+        if resp.status_code != 200:
+            return {}
+        conf = _parse_f2_conf(resp.text)
+    except requests.RequestException:
+        return {}
+    if not isinstance(conf, dict):
+        return {}
+    if any(k not in conf for k in _MSSDK_CONF_REQUIRED):
+        return {}
+    return conf
+
+
+def _load_ms_token_conf(timeout: float = 5.0) -> Dict[str, Any]:
+    """返回可用的 msToken 生成配置：远程（缓存）→ 内置快照。"""
+    global _ms_conf_cache, _ms_conf_retry_after
+    now = time.time()
+    with _ms_conf_lock:
+        cached, cached_at = _ms_conf_cache
+        if cached and (now - cached_at) < _MS_CONF_TTL:
+            return cached
+        if now < _ms_conf_retry_after:
+            return cached or _MSSDK_CONF
+
+    remote = _fetch_remote_ms_conf(timeout=timeout)
+    with _ms_conf_lock:
+        if remote:
+            _ms_conf_cache = (remote, time.time())
+            _ms_conf_retry_after = 0.0
+            return remote
+        # 失败：记住退避窗口，期间直接用（可能过期的）内置快照
+        _ms_conf_retry_after = time.time() + _MS_CONF_FAIL_BACKOFF
+        stale, _ = _ms_conf_cache
+        return stale or _MSSDK_CONF
 
 
 def _gen_fake_ms_token() -> str:
@@ -239,8 +490,13 @@ def _is_valid_ms_token(token: str) -> bool:
 
 
 def _gen_real_ms_token(timeout: float = 8.0) -> str:
-    """调用 mssdk 接口生成真实 msToken；失败返回空串。"""
-    conf = _MSSDK_CONF
+    """调用 mssdk 接口生成真实 msToken；失败返回空串。
+
+    配置优先用远程 F2 conf（见 :func:`_load_ms_token_conf`）：内置快照里的
+    ``strData`` / ``magic`` 会随抖音更新而失效（实测内置值返回
+    ``resultCode: -6``，导致真实 token 永远拿不到、静默退化为随机占位）。
+    """
+    conf = _load_ms_token_conf(timeout=timeout)
     payload = {
         "magic": conf["magic"],
         "version": conf["version"],
@@ -304,29 +560,69 @@ def ensure_ms_token(cookie: str = "") -> str:
 # ---------------------------------------------------------------- 参数与签名
 
 
+def _extract_uifid(cookie: str) -> str:
+    """返回 query 用的 uifid 值；默认**留空**（现状行为，实测最优）。
+
+    背景：Argus 会以 ``Blocked by ArgusSecurityPlugin Uifid Not Found``
+    拒绝请求，看名字像是「缺 uifid」，但实测证明**补上反而更差**：
+
+    ============= =========== ==========================
+    uifid 传值     成功/总数    失败时的报错
+    ============= =========== ==========================
+    空（现状）      3/4        ``Uifid Not Found``
+    填 Cookie 值    1/4        ``Signature Not Found``
+    ============= =========== ==========================
+
+    Cookie 里的 ``UIFID`` 是 320 字符的加密值，直接塞进 query 会让门禁
+    从「缺 uifid」推进到「签名不匹配」——即 uifid 只是第一道检查，真正
+    决定放行的是**页面上下文签名**（``x-secsdk-web-signature``），而它由
+    页面 JS 运行时生成，纯 HTTP 客户端无法伪造。
+
+    参考项目 jiji262/douyin-downloader 的结论与此一致：它最终放弃在 CLI
+    路径解决，改为在 desktop 版走 Electron 隐藏窗口（``page_bridge``）
+    用页面 SDK 补 uifid / timestamp / x-secsdk-web-signature。
+
+    因此这里**刻意保持留空**，并在 fetch_video_detail 里对
+    ``Signature``/``Uifid`` 类 403 直接判定为「不可重试」，避免无效重试
+    反而加速触发风控。若将来拿到正确的 uifid 形态，改此处即可。
+    """
+    return ""
+
+
 def default_query(cookie: str = "") -> Dict[str, str]:
-    """构造与浏览器一致的请求参数（风控校验的重要部分）。"""
+    """构造与浏览器一致的请求参数（风控校验的重要部分）。
+
+    屏幕/硬件参数取自**当前固定的浏览器指纹**，而不是写死值 ——
+    否则 query 与 a_bogus 签名内的指纹互相矛盾（实测签名随机出
+    1881x876、query 恒为 1536x864），与真实浏览器自洽性相悖。
+    """
+    _ensure_profile()
+    geom = _FP_GEOMETRY
+    # 指纹不可用（无 gmssl）时退回写死值，保证参数完整
+    screen_w = str(geom.get("screen_width") or 1536)
+    screen_h = str(geom.get("screen_height") or 864)
+    platform = _fp_platform(_UA)
     query = {
         "device_platform": "webapp",
         "aid": "6383",
         "channel": "channel_pc_web",
         "update_version_code": "170400",
         "pc_client_type": "1",
-        "pc_libra_divert": "Windows",
+        "pc_libra_divert": "Windows" if platform == "Win32" else "Mac",
         "version_code": "290100",
         "version_name": "29.1.0",
         "cookie_enabled": "true",
-        "screen_width": "1536",
-        "screen_height": "864",
+        "screen_width": screen_w,
+        "screen_height": screen_h,
         "browser_language": "zh-CN",
-        "browser_platform": "Win32",
+        "browser_platform": platform,
         "browser_name": "Chrome",
         "browser_version": "139.0.0.0",
         "browser_online": "true",
         "engine_name": "Blink",
         "engine_version": "139.0.0.0",
-        "os_name": "Windows",
-        "os_version": "10",
+        "os_name": "Windows" if platform == "Win32" else "Mac",
+        "os_version": "10" if platform == "Win32" else "10.15.7",
         "cpu_core_num": "16",
         "device_memory": "8",
         "platform": "PC",
@@ -335,28 +631,32 @@ def default_query(cookie: str = "") -> Dict[str, str]:
         "round_trip_time": "200",
         "support_h265": "1",
         "support_dash": "1",
-        "uifid": "",
+        "uifid": _extract_uifid(cookie),
         "msToken": ensure_ms_token(cookie),
     }
     return query
 
 
-def sign_url(url: str, user_agent: str = _UA) -> tuple:
+def sign_url(url: str, user_agent: str = None) -> tuple:
     """给 URL 追加签名（a_bogus 优先，X-Bogus 兜底）。
 
+    指纹与 UA 均取自**全局固定的 profile**，保证：
+      * 签名内嵌的 UA == 返回的 UA == 请求头 UA
+      * 签名指纹 == default_query 屏幕参数的来源
     :return: (签名后的完整 URL, 请求应使用的 User-Agent)
     """
+    _ensure_profile()
+    ua = user_agent or _UA
     base, sep, query = url.partition("?")
     if ABogus is not None:
         try:
-            fp = BrowserFingerprintGenerator.generate_fingerprint("Chrome")
-            signer = ABogus(fp=fp, user_agent=user_agent)
+            signer = ABogus(fp=_BROWSER_FP, user_agent=ua)
             params_with_ab, _ab, ab_ua, _body = signer.generate_abogus(query, "")
             return f"{base}?{params_with_ab}", ab_ua
         except Exception:
             pass  # 回退 X-Bogus
-    signed, _, _ = XBogus(user_agent).build(url)
-    return signed, user_agent
+    signed, _, _ = XBogus(ua).build(url)
+    return signed, ua
 
 
 # ---------------------------------------------------------------- ttwid
@@ -510,6 +810,15 @@ def fetch_video_detail(
                 raise DouyinAPIError(f"详情请求失败：{e}")
 
             if resp.status_code in _RISK_STATUSES or not resp.text:
+                # Argus 门禁是**确定性**拒绝（请求形状不符），重试 / 等待 /
+                # 重登都无效，只会加速触发验证码。实测 403 body：
+                #   "Blocked by ArgusSecurityPlugin Uifid Not Found"
+                #   "Blocked by ArgusSecurityPlugin Signature Not Found"
+                if _is_argus_rejection(resp.status_code, resp.text):
+                    raise RiskControlError(
+                        f"接口风控（{_argus_marker(resp.text)}）—— "
+                        "请求形状被确定性拒绝，重试 / 重登均无效",
+                        permanent=True)
                 if attempt < max_retries - 1:
                     time.sleep(_RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)])
                     continue

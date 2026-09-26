@@ -8,8 +8,10 @@ douyin_parser.py — 抖音作品解析模块（视频 + 图文图集）
   4. 视频作品：生成无水印播放地址
   5. 图文（图集）作品：解析 images 数组，生成无水印图片地址列表
 
-说明：抖音接口与页面结构会不定期变动，本模块采用多级回退策略，
-     若某个接口失效会自动尝试下一种方案；仍失败时抛出带提示的异常。
+说明：抖音接口与页面结构会不定期变动。历史上本模块采用多级回退，但
+     2026-09 实测后两级（iesdouyin iteminfo、详情页 HTML）均已彻底失效，
+     现已摘除，只保留官方 Web API 一条路径 —— 见 ``_fetch_info`` 的说明。
+     失败时抛出带提示的异常。
 """
 
 from __future__ import annotations
@@ -262,43 +264,40 @@ class DouyinParser:
         return bool(info.play_url) or bool(info.images)
 
     def _fetch_info(self, item_id: str) -> VideoInfo:
-        errors: list[str] = []
+        """获取作品信息。
 
-        # 方案 0：官方网页版 Web API（带 X-Bogus 签名 + 完整浏览器参数）
+        **只有一条有效路径**：官方 Web API（``/aweme/v1/web/aweme/detail/``）。
+
+        历史上还有两级回退，2026-09 实测均已彻底失效，故摘除：
+
+        * ``_fetch_from_api``（iesdouyin iteminfo）：恒返回
+          ``status_code=11110 / encrypt_data_miss``，旧接口已废弃。
+        * ``_fetch_from_page``（详情页 HTML）：页面已不再内嵌
+          ``aweme_detail`` / ``play_addr``（``_ROUTER_DATA`` 消失，
+          ``RENDER_DATA`` 只剩框架数据），解析不到播放地址。
+
+        摘除的原因不只是「没用」：它们会各发一次注定失败的请求，
+        白白增加风控暴露面；更糟的是把风控错误降级成误导性的
+        「作品可能已删除」。两者仍保留为方法（未来若抖音回退页面结构
+        可复用），但不再进入回退链。
+        """
+        cookie = self.session.headers.get("Cookie", "")
         try:
-            cookie = self.session.headers.get("Cookie", "")
             detail = douyin_api.fetch_video_detail(item_id, cookie=cookie)
-            info = self._build_info(detail, item_id)
-            if self._has_content(info):
-                return info
-            errors.append("官方接口未返回播放地址或图片")
         except douyin_api.RiskControlError:
-            # 风控必须向上传播：后续回退方案走同一网络环境，必然同样被拦，
-            # 且上层需要据此决定「刷新 Cookie 后重试」。
+            # 风控必须向上传播：上层据此决定「刷新 Cookie 后重试」。
             raise
         except (douyin_api.DouyinAPIError, requests.RequestException) as e:
-            errors.append(f"官方接口失败：{e}")
+            raise ParseError(
+                f"解析失败（官方接口不可用：{e}）。"
+                "建议：先登录抖音后重试（python main.py --login）。")
 
-        # 方案 1：iesdouyin iteminfo 接口（旧接口，可能失效）
-        try:
-            info = self._fetch_from_api(item_id)
-            if self._has_content(info):
-                return info
-            errors.append("iteminfo 接口未返回播放地址或图片")
-        except (ParseError, requests.RequestException) as e:
-            errors.append(f"iteminfo 接口失败：{e}")
-
-        # 方案 2：解析视频详情页 HTML
-        try:
-            info = self._fetch_from_page(item_id)
-            if self._has_content(info):
-                return info
-            errors.append("详情页未提取到播放地址或图片")
-        except (ParseError, requests.RequestException) as e:
-            errors.append(f"详情页解析失败：{e}")
-
-        raise ParseError("解析失败（" + "；".join(errors[-3:]) +
-                         "）。建议：先登录抖音后重试（python main.py --login）。")
+        info = self._build_info(detail, item_id)
+        if not self._has_content(info):
+            raise ParseError(
+                "解析失败（官方接口未返回播放地址或图片）。"
+                "该作品可能已删除 / 私密，或需要登录。")
+        return info
 
     def _fetch_from_api(self, item_id: str) -> VideoInfo:
         api = "https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/"

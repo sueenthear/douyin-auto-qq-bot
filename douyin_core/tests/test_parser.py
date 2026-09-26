@@ -12,7 +12,7 @@ from douyin_core.douyin_parser import (
     make_watermark_free,
 )
 from douyin_core import downloader
-from douyin_core.douyin_api import DouyinAPIError
+from douyin_core.douyin_api import DouyinAPIError, RiskControlError
 
 # 用户提供的示例分享文案（繁体 + 短链 + 尾部杂字符）
 SAMPLE_TEXT = (
@@ -131,40 +131,68 @@ def test_build_info_falls_back_to_play_addr():
 
 # ---------------------------------------------------------------- 回退逻辑
 
-def test_fetch_info_falls_back_to_page(monkeypatch):
+def test_fetch_info_propagates_risk_control(monkeypatch):
+    """风控必须原样上抛，不能被降级成普通 ParseError。
+
+    上层（handler）靠 RiskControlError 触发「刷新 Cookie 后重试」；
+    若被吞掉降级，自动重登就形同虚设。
+    """
     parser = DouyinParser()
-    # 方案 0（官方接口）必须 mock 掉，否则会走真实网络
     monkeypatch.setattr(
         "douyin_core.douyin_parser.douyin_api.fetch_video_detail",
         lambda item_id, cookie="", **kw: (_ for _ in ()).throw(
-            DouyinAPIError("官方接口不可用")))
+            RiskControlError("接口风控（HTTP 403）")))
+    with pytest.raises(RiskControlError):
+        parser._fetch_info("123")
 
-    def fake_api(item_id):
-        raise ParseError("接口不可用")
 
-    def fake_page(item_id):
-        return VideoInfo(item_id=item_id, title="来自页面",
-                         play_url="https://example.com/play/?v=1")
-
-    monkeypatch.setattr(parser, "_fetch_from_api", fake_api)
-    monkeypatch.setattr(parser, "_fetch_from_page", fake_page)
+def test_fetch_info_official_api_succeeds(monkeypatch):
+    """官方接口返回有效内容时直接采用。"""
+    parser = DouyinParser()
+    monkeypatch.setattr(
+        "douyin_core.douyin_parser.douyin_api.fetch_video_detail",
+        lambda item_id, cookie="", **kw: {
+            "aweme_id": item_id, "desc": "标题",
+            "video": {"play_addr": {"url_list": ["https://x/p.mp4"]}},
+        })
     info = parser._fetch_info("123")
-    assert info.title == "来自页面"
-    assert info.play_url == "https://example.com/play/?v=1"
+    assert info.play_url == "https://x/p.mp4"
 
 
-def test_fetch_info_raises_when_all_fail(monkeypatch):
-    """三级回退全部失败（非风控）→ 抛 ParseError 汇总原因。"""
+def test_fetch_info_dead_fallbacks_are_not_called(monkeypatch):
+    """已失效的两级回退（iteminfo / 详情页）不应再被调用。
+
+    实测它们必然失败，调用只会白耗请求、增加风控暴露。
+    """
     parser = DouyinParser()
     monkeypatch.setattr(
         "douyin_core.douyin_parser.douyin_api.fetch_video_detail",
         lambda item_id, cookie="", **kw: (_ for _ in ()).throw(
             DouyinAPIError("官方接口失败")))
-    monkeypatch.setattr(parser, "_fetch_from_api",
-                        lambda i: (_ for _ in ()).throw(ParseError("a")))
-    monkeypatch.setattr(parser, "_fetch_from_page",
-                        lambda i: (_ for _ in ()).throw(ParseError("b")))
-    with pytest.raises(ParseError, match="解析失败"):
+
+    called = []
+
+    def boom(name):
+        def inner(item_id):
+            called.append(name)
+            raise ParseError("不应被调用")
+        return inner
+
+    monkeypatch.setattr(parser, "_fetch_from_api", boom("api"))
+    monkeypatch.setattr(parser, "_fetch_from_page", boom("page"))
+
+    with pytest.raises(ParseError, match="官方接口不可用"):
+        parser._fetch_info("123")
+    assert called == []          # 两个失效回退都没被触达
+
+
+def test_fetch_info_raises_when_no_content(monkeypatch):
+    """官方接口成功但无播放地址/图片 → 明确报错（不再靠回退兜）。"""
+    parser = DouyinParser()
+    monkeypatch.setattr(
+        "douyin_core.douyin_parser.douyin_api.fetch_video_detail",
+        lambda item_id, cookie="", **kw: {"aweme_id": item_id, "desc": "空"})
+    with pytest.raises(ParseError, match="未返回播放地址或图片"):
         parser._fetch_info("123")
 
 
