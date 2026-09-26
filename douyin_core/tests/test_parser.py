@@ -193,6 +193,33 @@ def test_safe_filename():
     assert downloader.safe_filename("标题 带 空格  ") == "标题 带 空格"
 
 
+def test_safe_filename_strips_uri_special_chars():
+    """# 与 % 必须清洗，否则拼成 file:/// 后协议端解析失败。
+
+    # 会被当作 URL fragment 截断路径（SnowLuma 报 ENOENT）；
+    % 会触发 URI 解码并抛 "URI malformed"。
+    """
+    # 首尾的 _ 由既有的 strip(" ._") 去掉（与 Windows 保留字符同等处理）
+    assert downloader.safe_filename("#厚黑 #ootd") == "厚黑 _ootd"
+    assert downloader.safe_filename("100%纯棉") == "100_纯棉"
+    # 组合场景：线上真实标题
+    got = downloader.safe_filename("#厚黑 #ootd穿搭拍照 #厚黑美学")
+    assert "#" not in got and "%" not in got
+
+
+def test_build_filename_from_hash_title_stays_uri_safe():
+    """回归：带 # 标签的抖音标题不能再产出会被 URI 截断的文件名。"""
+    from qq_bot.napcat import to_file_uri
+    info = VideoInfo(item_id="7435226612766936370", author="眠眠羊毛衫",
+                     title="#厚黑 #ootd穿搭拍照 #厚黑美学")
+    name = downloader.build_filename(info)
+    assert "#" not in name and "%" not in name
+    uri = to_file_uri(r"C:\t\douyin_bot_x" + "\\" + name)
+    assert "#" not in uri
+    # 不含 # / ? 时，路径部分不应出现任何百分号编码歧义
+    assert uri.startswith("file:///C:/t/douyin_bot_x/")
+
+
 def test_build_filename():
     info = VideoInfo(item_id="7412345678901234567", author="元帝寶",
                      title="被電鑽過肩摔")

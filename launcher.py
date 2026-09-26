@@ -103,18 +103,22 @@ def check_douyin_core() -> list:
 
 
 def check_napcat(cfg) -> list:
-    """检查 NapCat 是否可连接。"""
+    """检查协议端（NapCat / SnowLuma）是否可连接，并按 config 解析后端。"""
     client = NapCatClient(cfg.ws_url, cfg.token, logger=lambda m: None)
     try:
         client.connect()
         info = client.get_login_info()
         status = client.get_status()
-        log(f"自检 3/3：NapCat 正常（{info.get('user_id')} "
+        if cfg.backend == "auto":
+            cfg.detected_backend = client.detect_backend() or "napcat"
+        log(f"自检 3/3：协议端正常（{info.get('user_id')} "
             f"{info.get('nickname')}，online={status.get('online')}）")
+        log(f"         协议端：{cfg.backend_label()}")
         return []
     except Exception as e:
-        return [f"NapCat 连接失败（{cfg.ws_url}）：{e}",
-                "处理：确认 NapCat 已启动，且 config.json 里的 ws_url / token 正确"]
+        return [f"协议端连接失败（{cfg.ws_url}）：{e}",
+                "处理：确认 NapCat / SnowLuma 已启动，"
+                "且 config.json 里的 ws_url / token 正确"]
     finally:
         client.close()
 
@@ -150,13 +154,17 @@ def run_session(cfg, watch_interval: float, login_interval: float,
     try:
         client.connect()
     except Exception as e:
-        return f"NapCat 连接失败：{e}\n处理：确认 NapCat 已启动后重试"
+        return (f"协议端连接失败：{e}\n"
+                "处理：确认 NapCat / SnowLuma 已启动后重试")
 
     info = client.get_login_info()
+    if cfg.backend == "auto":
+        cfg.detected_backend = client.detect_backend() or "napcat"
     bot = DouyinQQBot(cfg, client, self_id=info.get("user_id") or 0, logger=log)
     client.on_event = bot.on_event
 
-    log(f"已连接 NapCat：{info.get('user_id')} ({info.get('nickname')})")
+    log(f"已连接协议端：{info.get('user_id')} ({info.get('nickname')})")
+    log(f"实际协议端：{cfg.backend_label()}")
     log(f"监听：{cfg.describe_listen()}")
     log("机器人已启动（Ctrl+C 退出）")
 
@@ -165,8 +173,8 @@ def run_session(cfg, watch_interval: float, login_interval: float,
         while True:
             time.sleep(watch_interval)
             if not client.connected:
-                return ("NapCat 连接已断开\n"
-                        "处理：确认 NapCat 进程与网络端口后重试")
+                return ("协议端连接已断开\n"
+                        "处理：确认 NapCat / SnowLuma 进程与网络端口后重试")
             if watch_login and time.time() - last_login_check >= login_interval:
                 last_login_check = time.time()
                 if not check_douyin_login():
@@ -217,6 +225,7 @@ def main(argv=None) -> int:
         return 2
     log(f"接入配置：{cfg.config_path}")
     log(f"白名单　：{cfg.allow_path}（{len(cfg.listen)} 条）")
+    log(f"协议端　：{cfg.backend}")
 
     if args.check:
         problems = selftest(cfg)

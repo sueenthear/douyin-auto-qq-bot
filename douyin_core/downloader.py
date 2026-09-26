@@ -25,8 +25,19 @@ class DownloadError(Exception):
 
 
 def safe_filename(name: str, max_len: int = 80) -> str:
-    """把任意字符串转为 Windows 安全文件名。"""
-    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name)
+    """把任意字符串转为 Windows 安全文件名。
+
+    除 Windows 保留字符外，还须清洗 ``#`` 与 ``%`` ——
+    文件名会经 ``to_file_uri()`` 拼成 ``file:///`` 交给协议端，
+    而协议端用 ``fileURLToPath()`` 按 URI 规则解析：
+
+    * ``#`` 是 fragment 分隔符，会被当作 URL 片段截断路径
+      （``…\\眠眠羊毛衫_#厚黑….mp4`` → ``…\\眠眠羊毛衫_``），报 ENOENT
+    * ``%`` 会触发 URI 解码，非法序列直接抛 ``URI malformed``
+
+    ``?`` 同样会被截断，但它已在 Windows 保留字符里。
+    """
+    name = re.sub(r'[\\/:*?"<>|\r\n\t#%]', "_", name)
     name = re.sub(r"\s+", " ", name).strip(" ._")
     if not name:
         name = "video"

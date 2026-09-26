@@ -75,6 +75,7 @@ def main(argv=None) -> int:
     _log(f"白名单　：{cfg.allow_path}（{len(cfg.listen)} 条）")
     _log(f"NapCat　：{cfg.ws_url}")
     _log(f"监听　　：{cfg.describe_listen()}")
+    _log(f"协议端　：{cfg.backend}")
 
     client = NapCatClient(cfg.ws_url, cfg.token, on_event=None,
                           reconnect_interval=cfg.reconnect_interval,
@@ -82,12 +83,30 @@ def main(argv=None) -> int:
                           logger=_log)
     bot = DouyinQQBot(cfg, client, logger=_log)
 
+    def resolve_backend() -> str:
+        """按 config 的 backend 决定后端；auto 时探测并回填 cfg。"""
+        if cfg.backend != "auto":
+            return cfg.backend
+        detected = client.detect_backend()
+        if not detected:
+            # 探测失败（旧版协议端 / 无 app_name）：回退 NapCat。
+            # URI 编码已统一为 as_uri()，两个后端都能正确解析，
+            # 因此这里的回退只影响日志展示，不影响功能。
+            detected = "napcat"
+            _log("协议端：自动探测失败，回退按 napcat 处理")
+        else:
+            _log(f"协议端：自动探测为 {detected}")
+        cfg.detected_backend = detected
+        return detected
+
     if args.check:
         try:
             client.connect()
             info = client.get_login_info()
             _log(f"连接成功：{info.get('user_id')} ({info.get('nickname')})")
             _log(f"在线状态：{client.get_status()}")
+            resolve_backend()
+            _log(f"实际协议端：{cfg.backend_label()}")
             client.close()
             _log("配置与连接校验通过。")
             return 0
@@ -99,6 +118,8 @@ def main(argv=None) -> int:
         info = client.get_login_info()
         bot.self_id = info.get("user_id") or bot.self_id
         _log(f"已登录：{bot.self_id} ({info.get('nickname')})")
+        resolve_backend()
+        _log(f"实际协议端：{cfg.backend_label()}")
         client.on_event = bot.on_event
 
     _log("开始监听（Ctrl+C 退出）")

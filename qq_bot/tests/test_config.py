@@ -188,3 +188,44 @@ def test_load_config_keeps_default_messages_and_allows_override(tmp_path):
     cfg = load_config(cfg_path, allow_path)
     assert cfg.messages["video"] == "自定义视频文案"
     assert "图文" in cfg.messages["image"]      # 未覆盖的仍是默认
+
+
+# ---------------------------------------------------------------- 协议端后端
+
+def test_backend_defaults_to_auto(tmp_path):
+    cfg_path, allow_path = _make_config(tmp_path)
+    cfg = load_config(cfg_path, allow_path)
+    assert cfg.backend == "auto"
+    assert cfg.detected_backend == ""
+
+
+def test_backend_accepts_each_choice(tmp_path):
+    for value in ("auto", "napcat", "snowluma"):
+        cfg_path, allow_path = _make_config(tmp_path, config={"backend": value})
+        assert load_config(cfg_path, allow_path).backend == value
+
+
+def test_backend_is_normalized_to_lowercase(tmp_path):
+    cfg_path, allow_path = _make_config(tmp_path, config={"backend": "  SnowLuma "})
+    assert load_config(cfg_path, allow_path).backend == "snowluma"
+
+
+def test_backend_rejects_unknown_value(tmp_path):
+    cfg_path, allow_path = _make_config(tmp_path, config={"backend": "lagrange"})
+    with pytest.raises(ConfigError, match="backend 必须是"):
+        load_config(cfg_path, allow_path)
+
+
+def test_backend_label_reflects_source(tmp_path):
+    """backend_label 用于日志：区分 config 指定 / 自动探测。"""
+    cfg_path, allow_path = _make_config(tmp_path)
+    cfg = load_config(cfg_path, allow_path)
+    assert "未探测" in cfg.backend_label()          # auto 且尚未探测
+
+    cfg.detected_backend = "snowluma"
+    assert "snowluma" in cfg.backend_label()
+    assert "自动探测" in cfg.backend_label()
+
+    cfg2_path, allow2 = _make_config(tmp_path, config={"backend": "napcat"})
+    cfg2 = load_config(cfg2_path, allow2)
+    assert "config 指定" in cfg2.backend_label()

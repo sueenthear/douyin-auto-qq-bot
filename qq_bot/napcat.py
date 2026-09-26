@@ -1,17 +1,24 @@
 # -*- coding: utf-8 -*-
 """NapCat（OneBot 11）WebSocket 客户端。
 
-实测结论（NapCat「WS 正向服务器」，本机 3001 端口）：
+同时适配 **NapCat** 与 **SnowLuma** 两个协议端。实测结论：
 
 * 连接必须带 ``Authorization: Bearer <token>`` 头
 * 请求带 ``echo`` 字段做请求-响应配对；响应原样带回该 ``echo``
-* **本地文件必须写成 ``file:///`` + 正斜杠路径，且不做百分号编码** ——
-  一旦编码（``%E6%9A%96`` 之类）NapCat 无法解析，请求会挂死到超时
+* **本地文件写成 ``file:///`` + 正斜杠，并按 RFC 8089 做百分号编码**
+  （``Path.as_uri()``）。两个后端的解析机制不同：
+
+  - NapCat：``decodeURIComponent(uri.slice(8))`` —— 先切前缀再解码
+  - SnowLuma：Node ``fileURLToPath()`` —— 走 ``new URL()``，
+    未编码的 ``#`` 会被当作 fragment 截断路径（报 ``ENOENT``）
+
+  编码对两者都安全：NapCat 会解码还原，SnowLuma 本就要求编码。
 * 引用（回复）消息：message 数组首段为
   ``{"type": "reply", "data": {"id": "<message_id>"}}``
 * 合并转发：``send_private_forward_msg`` / ``send_group_forward_msg``，
   节点形如 ``{"type": "node", "data": {"uin", "name", "content": [...]}}``，
   节点 content 内可放 image 段
+* SnowLuma 要求 video 段必须是消息里**唯一**的段
 
 读线程与请求-响应共用同一条连接，因此 recv 只在读线程里发生，
 ``call()`` 通过 ``echo`` 从读线程取回自己的响应。
@@ -34,8 +41,36 @@ class NapCatError(Exception):
 
 
 def to_file_uri(path: str) -> str:
-    """本地路径 → NapCat 可接受的 file URI（正斜杠，不做百分号编码）。"""
-    return "file:///" + str(path).replace("\\", "/")
+    """本地路径 → 协议端可接受的 file URI（正斜杠 + 按 RFC 8089 编码）。
+
+    实现方式等价于 Python 的 ``pathlib.Path(path).as_uri()``：
+    只对 URI 中非法的字符做百分号编码（``#`` → ``%23``、``%`` → ``%25``、
+    空格 → ``%20`` 等），中文等非 ASCII 字符一律 UTF-8 编码。
+
+    两个协议端的解析方式（均已读源码 + 实测验证）：
+
+    * **NapCat**：``decodeURIComponent(uri.slice(8))`` —— 先切前缀再解码，
+      不做 URL 解析，因此 ``#`` / ``?`` 不会被当作 fragment 截断，
+      且能正确还原百分号编码。
+    * **SnowLuma**：Node ``fileURLToPath()`` —— 走 ``new URL()``，
+      未编码的 ``#`` 会被当作 fragment **截断路径**（报 ``ENOENT``），
+      未编码的 ``%`` 触发 ``URI malformed``。
+
+    结论：按 RFC 8089 编码对**两者都安全**，是唯一同时兼容的做法 ——
+    对无需编码的路径（含纯中文文件名）NapCat 侧解码后与原文一致，
+    SnowLuma 侧也能正确还原。
+    """
+    from pathlib import Path
+    try:
+        return Path(path).as_uri()
+    except (ValueError, OSError):
+        # 极端兜底：无法解析为绝对 URI 时退回朴素做法
+        return "file:///" + str(path).replace("\\", "/")
+
+
+# 后端探测：NapCat 与 SnowLuma 都实现了 get_version_info，
+# 返回体的 app_name 可用于区分（实测 NapCat→"NapCat"，SnowLuma→"SnowLuma"）
+BACKEND_PROBE_ACTION = "get_version_info"
 
 
 def build_node(uin, name: str, content: list) -> dict:
@@ -235,6 +270,27 @@ class NapCatClient:
 
     def get_status(self):
         return self.call("get_status", timeout=10)
+
+    def detect_backend(self, timeout: float = 10.0) -> str:
+        """探测协议端后端，返回 "napcat" / "snowluma" / ""（未知）。
+
+        两个后端都实现 ``get_version_info``，用返回体的 ``app_name`` 区分：
+        实测 SnowLuma → ``{"app_name": "SnowLuma", ...}``，
+        NapCat → ``app_name`` 含 ``NapCat``。探测失败（旧版无此接口、
+        或返回体无 app_name）时返回空串，由调用方决定回退策略。
+        """
+        try:
+            data = self.call(BACKEND_PROBE_ACTION, timeout=timeout)
+        except NapCatError:
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        name = str(data.get("app_name") or "").lower()
+        if "snowluma" in name:
+            return "snowluma"
+        if "napcat" in name:
+            return "napcat"
+        return ""
 
     def send_private_msg(self, user_id, message, timeout: Optional[float] = None):
         return self.call("send_private_msg", timeout=timeout,

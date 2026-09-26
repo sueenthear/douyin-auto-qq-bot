@@ -47,12 +47,31 @@ def test_image_nodes_caption_once_then_only_images():
         assert paths[index].replace("\\", "/") in content[0]["data"]["file"]
 
 
-def test_image_nodes_uses_file_uri_without_encoding():
-    """图片路径必须是 file:/// + 正斜杠且不做百分号编码。"""
+def test_image_nodes_uses_percent_encoded_file_uri():
+    """图片路径必须是 file:/// + 正斜杠，并按 RFC 8089 做百分号编码。
+
+    早期按 NapCat 实测结论「不做编码」，但 SnowLuma 走 Node 的
+    ``fileURLToPath()`` 按 URI 规则解析：不编码时 ``#`` 会被当作 fragment
+    截断路径、``%`` 会抛 URI malformed，导致本地文件发送失败（ENOENT）。
+    中文等非 ASCII 字符必须编码，否则 SnowLuma 还原不出原路径。
+    """
     nodes = build_image_nodes(1, "作者", "标题", [r"C:\目录\图 1.jpeg"])
     uri = nodes[1]["data"]["content"][0]["data"]["file"]
     assert uri.startswith("file:///C:/")
-    assert "%" not in uri
+    # 中文与空格均须编码，协议端才能还原
+    assert "%E7%9B%AE%E5%BD%95" in uri        # 目录
+    assert "%E5%9B%BE" in uri                 # 图
+    assert "%20" in uri                       # 空格
+    assert " " not in uri
+
+
+def test_image_nodes_encodes_hash_in_filename():
+    """回归：文件名含 # 时不得原样出现在 URI 里（会被当作 URL fragment 截断）。"""
+    nodes = build_image_nodes(1, "作者", "标题",
+                              [r"C:\a\眠眠羊毛衫_#厚黑_1.jpeg"])
+    uri = nodes[1]["data"]["content"][0]["data"]["file"]
+    assert "#" not in uri
+    assert "%23" in uri
 
 
 def test_image_nodes_author_fallback():

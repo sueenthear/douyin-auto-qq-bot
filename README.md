@@ -97,6 +97,7 @@ pip install -r requirements.txt
 | `request_min_interval` | **请求节流**：两次抖音请求的最小间隔秒数，默认 `1`；频繁被风控就调大 |
 | `request_jitter_ratio` | 节流的随机抖动比例，默认 `0.5`（实际间隔 = 1.0~1.5 倍） |
 | `proxy` | 代理地址（如 `http://127.0.0.1:7890`），用于规避 IP 风控；空 = 直连 |
+| `backend` | 协议端后端：`auto`（默认，连接后自动探测）/ `napcat` / `snowluma` |
 | `messages` | （可选）自定义回复文案，见 2.3 |
 
 ### 2.2 `allow.txt` —— 监听白名单
@@ -408,12 +409,105 @@ python -m pytest douyin_core/tests qq_bot/tests -q
 ## NapCat 接入要点（实测）
 
 - 连接需带 `Authorization: Bearer <token>` 头；请求用 `echo` 字段做请求-响应配对
-- **本地文件必须写成 `file:///` + 正斜杠路径，且不做百分号编码** ——
-  编码后（`%E6%9A%96` 之类）NapCat 无法解析，请求会挂死到超时
+- **本地文件写成 `file:///` + 正斜杠，并按 RFC 8089 做百分号编码**
+  （等价于 Python `pathlib.Path(p).as_uri()`）
 - 引用回复：message 数组首段 `{"type":"reply","data":{"id":"<message_id>"}}`
 - 合并转发：`send_private_forward_msg` / `send_group_forward_msg`，
   节点 `{"type":"node","data":{"uin","name","content":[...]}}`，节点内可放图片
 - 读超时必须大于 NapCat 心跳间隔，否则空闲时会被误判断线
+
+## 协议端兼容：NapCat 与 SnowLuma
+
+本项目同时适配 **NapCat** 与 **SnowLuma**（两者都是 OneBot v11 协议端，
+NapCatQQ Desktop 可管理任一种）。两者对本地文件 URI 的**解析机制不同**，
+这是「同一个机器人，换协议端后视频发不出去」的根因。
+
+### 两者的解析实现（读源码实测）
+
+| | 还原代码 | 机制 |
+|---|---|---|
+| NapCat | `decodeURIComponent(uri.slice(8))` <br>（`napcat.mjs`） | 切掉 `file:///` 前缀后直接解码，**不做 URL 解析** |
+| SnowLuma | Node `fileURLToPath()` <br>（`index.mjs`） | 走 `new URL()`，**遵循 URI 语法** |
+
+因此对未编码的特殊字符，两者行为**不一致**（实测矩阵）：
+
+| 文件名含 | NapCat | SnowLuma |
+|---|---|---|
+| 普通字符 / 中文 / 空格 | ✅ | ✅ |
+| `#` | ✅ | ❌ 被当 fragment **截断路径** → `ENOENT` |
+| `?` | ✅ | ❌ 同上 |
+| `%` | ❌ `URI malformed` | ❌ `URI malformed` |
+
+### 解法：按 RFC 8089 编码
+
+`to_file_uri()` 用 `pathlib.Path(p).as_uri()` 统一编码。这样做**对两者都安全**：
+
+- **SnowLuma** 用 `fileURLToPath()` 解析，本就要求编码；
+- **NapCat** 的 `decodeURIComponent` 会把编码**正确还原**，所以也能用。
+
+注意：编码后 NapCat 侧的 URI 字符串与「不编码」写法**并不相同**
+（中文路径会变成 `%E5%85%83` 形式），但因为 NapCat 会解码，**最终拿到的
+本地路径完全一致**。旧实现「不做百分号编码」的前提是当时只跑 NapCat。
+
+同时 `downloader.safe_filename()` 额外清洗 `#` 与 `%`：
+
+1. 让文件名更干净可读；
+2. 兜住**目录名**含这些字符的情况（例如下载目录本身带 `#`）。
+
+> `?` 本就在 Windows 保留字符里，已被原有规则清洗。
+
+### 后端选择：`backend`
+
+```json
+{ "backend": "auto" }
+```
+
+| 值 | 行为 |
+|---|---|
+| `auto`（默认） | 连接后调 `get_version_info`，按返回的 `app_name` 自动判定 |
+| `napcat` | 强制按 NapCat 处理 |
+| `snowluma` | 强制按 SnowLuma 处理 |
+
+探测依据（实测）：SnowLuma 返回 `{"app_name": "SnowLuma", ...}`，
+NapCat 返回含 `NapCat`。探测失败（旧版无该接口）时回退 `napcat`。
+
+> 由于 URI 编码已统一，`backend` 目前**只影响日志展示**，两个后端都能正常工作。
+> 该字段保留为显式声明与后续针对差异扩展的入口。
+
+### 症状与根因（实测记录）
+
+SnowLuma 下发视频时的日志：
+
+```
+send_private_msg failed: ENOENT: no such file or directory,
+realpath 'C:\Users\...\Temp\douyin_bot_j3cqjrpc\眠眠羊毛衫_'
+    at async stageSourceToDisk  (index.mjs:16572)
+    at async loadVideo          (index.mjs:16908)
+    at async uploadVideoMsgInfo (index.mjs:16953)
+```
+
+路径在 `眠眠羊毛衫_` 处**被截断**：作品标题是
+`#厚黑 #ootd穿搭拍照 #厚黑美学`，拼出的文件名以 `#` 开头，
+`file:///…` 里的 `#` 被 URI 解析器当作 fragment 起点，路径到此为止 ——
+于是 `realpath` 找不到文件。
+
+**复制该现象的等价最小验证**（Node）：
+
+```js
+fileURLToPath("file:///C:/t/眠眠羊毛衫_#厚黑_1.mp4")
+// → "C:\\t\\眠眠羊毛衫_"     ← 被截断
+fileURLToPath("file:///C:/t/%E7%9C%A0...%23%E5%8E%9A%E9%BB%91_1.mp4")
+// → "C:\\t\\眠眠羊毛衫_#厚黑_1.mp4"   ← 正确还原
+```
+
+### 其他实测要点
+
+- **视频段必须是消息里唯一的段**：SnowLuma 的 `assertVideoSendPolicy`
+  要求一条消息只含一个 video 段且为唯一段，因此本项目单独发视频（不带文字）。
+- **缩略图**：SnowLuma 读 OneBot 标准的 `data.thumb` 字段
+  （`thumbUrl: data.thumb ? String(data.thumb) : undefined`），
+  本项目发送视频时附上作品封面即被识别。SnowLuma 自带 `ffmpegAddon`
+  （不需要系统装 ffmpeg），即使不给 `thumb` 也能自行抽帧。
 
 ---
 

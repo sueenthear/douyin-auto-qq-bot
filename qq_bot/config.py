@@ -10,6 +10,7 @@
         "reconnect_interval": 5,
         "read_timeout": 90
       },
+      "backend": "auto",
       "download_dir": "downloads",
       "keep_files": false,
       "cookie_refresh_timeout": 60,
@@ -42,6 +43,15 @@ COMMENT_PREFIX = "//"
 
 DEFAULT_CONFIG_FILE = "config.json"
 DEFAULT_ALLOW_FILE = "allow.txt"
+
+# 协议端后端：
+#   auto     —— 连接后按 get_version_info 的 app_name 自动判定（默认）
+#   napcat   —— 强制 NapCat
+#   snowluma —— 强制 SnowLuma
+BACKEND_AUTO = "auto"
+BACKEND_NAPCAT = "napcat"
+BACKEND_SNOWLUMA = "snowluma"
+BACKEND_CHOICES = (BACKEND_AUTO, BACKEND_NAPCAT, BACKEND_SNOWLUMA)
 
 # 风控重试默认值：最多尝试 3 次（含首次），每次重试前等待 3 秒
 DEFAULT_RISK_ATTEMPTS = 3
@@ -159,6 +169,18 @@ class BotConfig:
     request_jitter_ratio: float = 0.5
     # 代理（防 IP 维度风控）；空 = 直连
     proxy: str = ""
+    # 协议端后端：auto / napcat / snowluma（见 BACKEND_CHOICES）
+    backend: str = BACKEND_AUTO
+    # auto 探测出的实际后端（由 NapCatClient 连接后回填）
+    detected_backend: str = ""
+
+    def backend_label(self) -> str:
+        """用于日志展示的后端描述。"""
+        if self.backend != BACKEND_AUTO:
+            return f"{self.backend}（config 指定）"
+        if self.detected_backend:
+            return f"{self.detected_backend}（自动探测）"
+        return "auto（未探测）"
 
     def is_watched(self, message_type: str, target_id: int) -> bool:
         """该会话是否在白名单内。"""
@@ -248,6 +270,13 @@ def load_config(config_path: str = DEFAULT_CONFIG_FILE,
     cfg.request_jitter_ratio = max(0.0, _as_float(
         data.get("request_jitter_ratio"), "request_jitter_ratio", 0.5))
     cfg.proxy = str(data.get("proxy") or "").strip()
+
+    raw_backend = str(data.get("backend") or BACKEND_AUTO).strip().lower()
+    if raw_backend not in BACKEND_CHOICES:
+        raise ConfigError(
+            f"backend 必须是 {' / '.join(BACKEND_CHOICES)} 之一，"
+            f"收到 {data.get('backend')!r}")
+    cfg.backend = raw_backend
 
     messages = dict(DEFAULT_MESSAGES)
     raw_messages = data.get("messages")

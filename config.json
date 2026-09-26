@@ -5,6 +5,7 @@
     "reconnect_interval": 5,
     "read_timeout": 90
   },
+  "backend": "auto",
   "download_dir": "downloads",
   "keep_files": false,
   "process_timeout": 300,
